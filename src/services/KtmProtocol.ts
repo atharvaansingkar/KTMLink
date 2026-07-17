@@ -5,6 +5,7 @@ export const KTM_UUIDS = {
   NAVIGATION_STATE:  '71ced1ac-0703-44f5-9454-806ff70b3e02',
   TURN_DISTANCE:     '71ced1ac-0705-44f5-9454-806ff70b3e02',
   TURN_ROAD:         '71ced1ac-0707-44f5-9454-806ff70b3e02',
+  NOTIFICATION:      '71ced1ac-070a-44f5-9454-806ff70b3e02',
 };
 
 // Pure JS UTF-8 encoder — no Buffer/TextEncoder polyfill needed in React Native
@@ -43,5 +44,14 @@ export const buildTurnDistancePayload = (distanceText: string): Uint8Array => {
   const payload = new Uint8Array(1 + textBytes.length);
   payload[0] = 0x03;
   payload.set(textBytes, 1);
+  return payload;
+};
+
+export const buildNotificationPayload = (text: string): Uint8Array => {
+  const textBytes = textToBytes(text.substring(0, 16)); // Max 16 chars
+  const payload = new Uint8Array(2 + textBytes.length);
+  payload[0] = 0x03; // Visibility Byte
+  payload[1] = 0x06; // Icon Byte (Information)
+  payload.set(textBytes, 2);
   return payload;
 };

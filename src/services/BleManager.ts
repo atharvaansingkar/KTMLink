@@ -33,7 +33,7 @@ export const stopScan = () => {
 
 // ─── Imports ──────────────────────────────────────────────────────────────────
 import { KTM_UUIDS } from './KtmProtocol';
-import { buildTurnRoadPayload, buildTurnDistancePayload } from './KtmProtocol';
+import { buildTurnRoadPayload, buildTurnDistancePayload, buildNotificationPayload } from './KtmProtocol';
 import {
   computeTempIvAndSecret,
   getRandomBytes,
@@ -195,24 +195,31 @@ const queuedWrite = (
 
 // ─── Activation Sequence ──────────────────────────────────────────────────────
 const activateDashboard = (device: Device) => {
+  if (!activeSessionKey || !currentTempIv) {
+    console.error('[BleManager] Cannot activate dashboard: keys missing.');
+    return;
+  }
+
   // 1. Unlock display engine: write [0x03, 0xFF] to NAVIGATION_STATE (0703)
   //    0x03 = guidanceOn + gpsIconOn
   const unlockPayload = new Uint8Array([0x03, 0xFF]);
+  const encUnlock = frameAndEncryptData(unlockPayload, activeSessionKey, currentTempIv);
   queuedWrite(
     device,
     KTM_UUIDS.MAIN_SERVICE,
     KTM_UUIDS.NAVIGATION_STATE,
-    bytesToBase64(unlockPayload),
+    bytesToBase64(encUnlock),
     'Unlock display (0703)',
   );
 
   // 2. Send greeting: "Hello Atharva!" via TURN_ROAD (0707)
   const greetingPayload = buildTurnRoadPayload('Hello Atharva!');
+  const encGreeting = frameAndEncryptData(greetingPayload, activeSessionKey, currentTempIv);
   queuedWrite(
     device,
     KTM_UUIDS.MAIN_SERVICE,
     KTM_UUIDS.TURN_ROAD,
-    bytesToBase64(greetingPayload),
+    bytesToBase64(encGreeting),
     'Greeting (0707)',
   );
 };
@@ -456,7 +463,7 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
  * Silently discards if the crypto handshake is not yet complete.
  */
 export const streamLiveNavigation = async (distance: string, road: string): Promise<void> => {
-  if (!activeSessionKey || !connectedDevice) {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) {
     // Not authenticated yet — drop silently
     return;
   }
@@ -464,11 +471,12 @@ export const streamLiveNavigation = async (distance: string, road: string): Prom
   // 1. Write distance to TURN_DISTANCE (0705)
   if (distance.trim()) {
     const distPayload = buildTurnDistancePayload(distance);
+    const encDist = frameAndEncryptData(distPayload, activeSessionKey, currentTempIv);
     queuedWrite(
       connectedDevice,
       KTM_UUIDS.MAIN_SERVICE,
       KTM_UUIDS.TURN_DISTANCE,
-      bytesToBase64(distPayload),
+      bytesToBase64(encDist),
       'Nav: distance',
     );
   }
@@ -476,12 +484,33 @@ export const streamLiveNavigation = async (distance: string, road: string): Prom
   // 2. Write road name to TURN_ROAD (0707)
   if (road.trim()) {
     const roadPayload = buildTurnRoadPayload(road);
+    const encRoad = frameAndEncryptData(roadPayload, activeSessionKey, currentTempIv);
     queuedWrite(
       connectedDevice,
       KTM_UUIDS.MAIN_SERVICE,
       KTM_UUIDS.TURN_ROAD,
-      bytesToBase64(roadPayload),
+      bytesToBase64(encRoad),
       'Nav: road',
+    );
+  }
+};
+
+// ─── Dashboard Notifications ──────────────────────────────────────────────────
+export const sendDashboardNotification = async (text: string): Promise<void> => {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) {
+    console.error('[BleManager] Cannot send notification: not authenticated.');
+    return;
+  }
+
+  if (text.trim()) {
+    const notifPayload = buildNotificationPayload(text);
+    const encNotif = frameAndEncryptData(notifPayload, activeSessionKey, currentTempIv);
+    queuedWrite(
+      connectedDevice,
+      KTM_UUIDS.MAIN_SERVICE,
+      KTM_UUIDS.NOTIFICATION, // 070a
+      bytesToBase64(encNotif),
+      'Notification (070a)',
     );
   }
 };
