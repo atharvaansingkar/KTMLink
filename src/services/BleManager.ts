@@ -32,8 +32,20 @@ export const stopScan = () => {
 };
 
 // ─── Imports ──────────────────────────────────────────────────────────────────
-import { KTM_UUIDS } from './KtmProtocol';
-import { buildTurnRoadPayload, buildTurnDistancePayload, buildNotificationPayload } from './KtmProtocol';
+import {
+  KTM_UUIDS,
+  Visibility,
+  buildTurnIconPayload,
+  buildTurnDistancePayload,
+  buildTurnInfoPayload,
+  buildTurnRoadPayload,
+  buildEtaPayload,
+  buildRemainingDistPayload,
+  buildNotificationPayload,
+  buildNavigationStatePayload,
+  NotificationIconType,
+} from './KtmProtocol';
+import { TurnIcon } from './TurnIconMapper';
 import {
   computeTempIvAndSecret,
   getRandomBytes,
@@ -97,11 +109,8 @@ let connectedDevice: Device | null = null;
 
 // ─── Reconnect State ──────────────────────────────────────────────────────────
 // Mirrors BccuConnectionService.kt's handshake recovery + reconnect watchdog.
-// When the bike drops the BLE link (15s auth timeout, radio recycle, etc.),
-// we automatically retry up to MAX_RECONNECT_ATTEMPTS times with a brief
-// cooldown between attempts.
 const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_COOLDOWN_MS = 3000; // 3 seconds between retries
+const RECONNECT_COOLDOWN_MS = 3000;
 let reconnectAttempts = 0;
 let reconnectTargetId: string | null = null;
 let reconnectEnabled = false;
@@ -124,26 +133,33 @@ export const setHandshakeCallbacks = (callbacks: HandshakeCallbacks) => {
   handshakeCallbacks = callbacks;
 };
 
-// ─── GATT Write Queue ─────────────────────────────────────────────────────────
-// Mirrors BccuConnectionService.kt's enqueueGattOp / gattBusy / gattOpFinished
-// pattern. Android's BLE stack is single-threaded: only ONE GATT operation can
-// be in flight at a time. The official app enforces this with an ArrayDeque +
-// a gattBusy flag. react-native-ble-plx serialises internally, but its
-// Promise-based API doesn't protect against firing a write while the stack is
-// still ACK'ing an incoming Indication. This queue adds explicit pacing.
+// ─── GATT Write Queue with Coalescing ─────────────────────────────────────────
+// Mirrors BccuConnectionService.kt's enqueueGattOp / gattBusy / gattOpFinished.
 //
-// Key insight from tv4.java: on write SUCCESS, drain immediately (j()).
-// On write FAILURE (133/201), retry after 250ms (postDelayed).
+// KEY ADDITION: coalesceKey support. For "latest value wins" display writes
+// (guidance labels, marquee frames), a still-queued older write to the same
+// characteristic is dropped — keeping the queue bounded and frames fresh on
+// a slow BLE link. Control-plane ops (auth replies) use null coalesceKey.
 type GattOp = {
   label: string;
+  coalesceKey: string | null;
   run: () => Promise<void>;
 };
 
 const gattQueue: GattOp[] = [];
 let gattBusy = false;
 
-const enqueueGattOp = (label: string, op: () => Promise<void>) => {
-  gattQueue.push({ label, run: op });
+const enqueueGattOp = (label: string, op: () => Promise<void>, coalesceKey: string | null = null) => {
+  // If coalescing, remove any queued op with the same key
+  if (coalesceKey) {
+    for (let i = gattQueue.length - 1; i >= 0; i--) {
+      if (gattQueue[i].coalesceKey === coalesceKey) {
+        console.log(`[GattQueue] Coalescing: dropped stale ${gattQueue[i].label}`);
+        gattQueue.splice(i, 1);
+      }
+    }
+  }
+  gattQueue.push({ label, coalesceKey, run: op });
   console.log(`[GattQueue] Enqueued: ${label} (depth=${gattQueue.length})`);
   runNextGattOp();
 };
@@ -167,15 +183,16 @@ const runNextGattOp = async () => {
       gattBusy = false;
       runNextGattOp();
     }, 250);
-    return; // Don't drain yet — wait for the retry timer
+    return;
   }
   gattBusy = false;
-  runNextGattOp(); // Drain next immediately on success
+  runNextGattOp();
 };
 
 /**
- * Write to a characteristic via the GATT queue, matching the official app's
- * WRITE_TYPE_DEFAULT behavior. All writes go through here — never direct.
+ * Write to a characteristic via the GATT queue.
+ * @param coalesce - If true, drops any older queued write to the same char UUID.
+ *                   Use for display writes. Never for auth/control writes.
  */
 const queuedWrite = (
   device: Device,
@@ -183,6 +200,7 @@ const queuedWrite = (
   charUuid: string,
   base64Data: string,
   label: string,
+  coalesce: boolean = false,
 ) => {
   enqueueGattOp(label, async () => {
     await device.writeCharacteristicWithResponseForService(
@@ -190,7 +208,7 @@ const queuedWrite = (
       charUuid,
       base64Data,
     );
-  });
+  }, coalesce ? charUuid : null);
 };
 
 // ─── Activation Sequence ──────────────────────────────────────────────────────
@@ -200,29 +218,39 @@ const activateDashboard = (device: Device) => {
     return;
   }
 
-  // 1. Unlock display engine: write [0x03, 0xFF] to NAVIGATION_STATE (0703)
-  //    0x03 = guidanceOn + gpsIconOn
-  const unlockPayload = new Uint8Array([0x03, 0xFF]);
-  const encUnlock = frameAndEncryptData(unlockPayload, activeSessionKey, currentTempIv);
-  queuedWrite(
-    device,
-    KTM_UUIDS.MAIN_SERVICE,
-    KTM_UUIDS.NAVIGATION_STATE,
-    bytesToBase64(encUnlock),
-    'Unlock display (0703)',
-  );
+  // 1. Unlock display engine: guidanceOn + gpsIconOn
+  //    The dash requires this before it will render TURN_ICON/TURN_ROAD content.
+  //    Confirmed from BccuConnectionService.kt line 967.
+  const navStatePayload = buildNavigationStatePayload(true, true);
+  const encNavState = frameAndEncryptData(navStatePayload, activeSessionKey, currentTempIv);
+  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.NAVIGATION_STATE,
+    bytesToBase64(encNavState), 'NavState: guidance ON');
 
-  // 2. Send greeting: "Hello Atharva!" via TURN_ROAD (0707)
+  // 2. Show START icon + greeting on the center display
+  //    Matches BccuConnectionService.kt sendGreeting() line 1282-1302
+  const iconPayload = buildTurnIconPayload(TurnIcon.START, Visibility.FULL);
+  const encIcon = frameAndEncryptData(iconPayload, activeSessionKey, currentTempIv);
+  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
+    bytesToBase64(encIcon), 'Greeting: START icon', true);
+
   const greetingPayload = buildTurnRoadPayload('Hello Atharva!');
   const encGreeting = frameAndEncryptData(greetingPayload, activeSessionKey, currentTempIv);
-  queuedWrite(
-    device,
-    KTM_UUIDS.MAIN_SERVICE,
-    KTM_UUIDS.TURN_ROAD,
-    bytesToBase64(encGreeting),
-    'Greeting (0707)',
-  );
+  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
+    bytesToBase64(encGreeting), 'Greeting: road text', true);
+
+  // 3. Hide distance during greeting (visibility OFF)
+  const emptyDist = buildTurnDistancePayload('', Visibility.OFF);
+  const encEmptyDist = frameAndEncryptData(emptyDist, activeSessionKey, currentTempIv);
+  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
+    bytesToBase64(encEmptyDist), 'Greeting: hide distance', true);
+
+  // 4. Auto-clear greeting after 6 seconds (replaced by real nav if it arrives sooner)
+  greetingClearTimer = setTimeout(() => {
+    clearGuidance();
+  }, 6000);
 };
+
+let greetingClearTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ─── Auto-Reconnect on Disconnect ─────────────────────────────────────────────
 const handleBleDisconnect = (deviceId: string) => {
@@ -231,7 +259,6 @@ const handleBleDisconnect = (deviceId: string) => {
   gattQueue.length = 0;
   gattBusy = false;
 
-  // If we already authenticated, don't auto-reconnect (the session is over)
   if (activeSessionKey) {
     console.log('[BleManager] Was authenticated — resetting session state.');
     currentTempIv = null;
@@ -241,7 +268,6 @@ const handleBleDisconnect = (deviceId: string) => {
     return;
   }
 
-  // If we were mid-handshake and haven't exhausted retries, auto-reconnect
   if (reconnectEnabled && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     reconnectAttempts++;
     const attempt = reconnectAttempts;
@@ -253,8 +279,6 @@ const handleBleDisconnect = (deviceId: string) => {
         await connectToDevice(deviceId);
       } catch (e) {
         console.error(`[BleManager] Reconnect attempt ${attempt} failed:`, e);
-        // handleBleDisconnect will fire again if the connection drops,
-        // which will trigger the next retry automatically.
       }
     }, RECONNECT_COOLDOWN_MS);
   } else {
@@ -268,8 +292,6 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
   try {
     console.log('[BleManager] Connecting directly to:', deviceId);
 
-    // ── Preemptive Socket Safety Check ──
-    // Remove any previous disconnect listener
     if (disconnectSubscription) {
       disconnectSubscription.remove();
       disconnectSubscription = null;
@@ -279,10 +301,9 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
       await connectedDevice.cancelConnection().catch(() => {});
       connectedDevice = null;
     }
-    // Ensure the manager drops any native lingering socket for this ID
     await bleManager.cancelDeviceConnection(deviceId).catch(() => {});
 
-    // Reset handshake state for a clean session
+    // Reset handshake state
     currentTempIv = null;
     currentTempSecret = null;
     activeSessionKey = null;
@@ -290,32 +311,24 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
     gattBusy = false;
     reconnectTargetId = deviceId;
     reconnectEnabled = true;
+    if (greetingClearTimer) { clearTimeout(greetingClearTimer); greetingClearTimer = null; }
 
     stopScan();
 
-    // 1. Connect
     const device = await bleManager.connectToDevice(deviceId);
     console.log('[BleManager] Connected to:', device.name);
 
-    // 2. Register disconnect listener IMMEDIATELY after connection
-    //    (mirrors BccuConnectionService's onConnectionStateChange DISCONNECTED handler)
     disconnectSubscription = device.onDisconnected((error) => {
       console.log('[BleManager] onDisconnected fired:', error?.message || 'clean');
       handleBleDisconnect(deviceId);
     });
 
-    // 3. Discover services & characteristics
     await device.discoverAllServicesAndCharacteristics();
     console.log('[BleManager] Services discovered.');
 
-    // 4. MTU expansion — KTM requires 517 for AES payloads.
-    //    This is the ONE AND ONLY place requestMTU is called.
     await device.requestMTU(517);
     console.log('[BleManager] MTU expanded to 517.');
 
-    // 5. KTM Handshake — start monitoring AUTH_REQ IMMEDIATELY.
-    //    Speed is critical: the bike's firmware has a ~15s timeout for
-    //    unauthenticated BLE links. Every millisecond counts.
     if (device.name?.includes('KTM')) {
       connectedDevice = device;
       console.log('[BleManager] Starting KTM AES handshake...');
@@ -329,21 +342,10 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
             console.error('[BleManager] AUTH_REQ monitor error:', error);
             return;
           }
-
           if (!characteristic?.value) return;
-
           const rawBytes = base64ToBytes(characteristic.value);
 
-          // ── CRITICAL: Detach processing from the BLE callback thread ──
-          // Android's GATT stack is single-threaded. The onCharacteristicChanged
-          // callback (which delivers this Indication) must RETURN before the
-          // stack will process any new GATT operation (our write). If we await
-          // a write inside this callback, the write is submitted while the
-          // stack is still locked sending the Indication ACK → status 133/201.
-          //
-          // The official app (BccuConnectionService.kt) handles this naturally
-          // because Kotlin coroutines + enqueueGattOp post the work to a
-          // separate handler. We replicate this with setTimeout(0).
+          // Detach from BLE callback thread — same pattern as BccuConnectionService.kt
           setTimeout(() => {
             handleAuthIndication(device, rawBytes);
           }, 0);
@@ -351,11 +353,7 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
       );
     }
 
-    // Return minimal info immediately — do NOT enumerate all services here.
-    // The old loop (services → characteristics) was burning seconds during
-    // the bike's 15-second auth timeout window. Log asynchronously instead.
     const results: string[] = [`Connected: ${device.name || deviceId}`];
-    // Fire-and-forget service enumeration for debug (non-blocking)
     device.services().then(async svcs => {
       for (const svc of svcs) {
         console.log(`[BleManager] Service: ${svc.uuid}`);
@@ -370,11 +368,10 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
   }
 };
 
-// ─── Auth Indication Handler (runs OUTSIDE the BLE callback thread) ──────────
+// ─── Auth Indication Handler ──────────────────────────────────────────────────
 const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
   try {
     if (rawBytes.length === 16 && !currentTempIv) {
-      // ── Step 1: Nonce Exchange ──
       const m1 = rawBytes;
       console.log('[BleManager] m1 received. Generating m2...');
       const m2 = getRandomBytes(16);
@@ -382,18 +379,15 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
       currentTempIv = tempIv;
       currentTempSecret = tempSecret;
 
-      // m2 is sent as plaintext (not encrypted), matching BccuConnectionService L886
       queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.AUTH_REP, bytesToBase64(m2), 'Auth: m2 nonce');
       handshakeCallbacks?.onNoncesSwapped();
 
     } else if (currentTempIv && currentTempSecret) {
-      // ── Steps 2–4: Encrypted Control Flow ──
       const decrypted = decryptControl(rawBytes, currentTempSecret, currentTempIv);
-      const cmd = decrypted[2] & 0xFF; // command lives at index 2 per protocol
+      const cmd = decrypted[2] & 0xFF;
       console.log(`[BleManager] Control message received. cmd=0x${cmd.toString(16)}`);
 
       if (cmd === 0x00) {
-        // CMD_HELLO — always echo HELLO back (BccuConnectionService L900-913)
         console.log('[BleManager] CMD_HELLO — echoing back.');
         const reply = buildControlPacket(0x00);
         const enc   = encryptControl(reply, currentTempSecret, currentTempIv);
@@ -401,22 +395,19 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
         handshakeCallbacks?.onHelloExchanged();
 
       } else if (cmd === 0x01) {
-        // CMD_GENERATE_KEYS (BccuConnectionService L915-927)
         console.log('[BleManager] CMD_GENERATE_KEYS — deriving SHA-512 pool...');
         const mirrored  = buildMirrored(decrypted);
         sessionKeys     = deriveSessionKeys(decrypted, mirrored, currentTempIv, currentTempSecret);
 
-        // Persist session keys for fast-reconnection (BccuConnectionService L924-926)
         const b64Keys = sessionKeys.map(k => bytesToBase64(k));
         await AsyncStorage.setItem('ktm_session_keys', JSON.stringify(b64Keys));
 
-        const reply = buildControlPacket(0x02); // CMD_KEYS_GENERATED
+        const reply = buildControlPacket(0x02);
         const enc   = encryptControl(reply, currentTempSecret, currentTempIv);
         queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.AUTH_REP, bytesToBase64(enc), 'Auth: KEYS_GENERATED');
         handshakeCallbacks?.onKeysGenerated();
 
       } else if (cmd >= 0x10 && cmd <= 0x1F) {
-        // CMD_SELECT_KEY (BccuConnectionService L929-949)
         const keyIndex = cmd & 0x0F;
         console.log(`[BleManager] CMD_SELECT_KEY — index ${keyIndex}.`);
 
@@ -435,8 +426,8 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
 
         if (sessionKeys.length > keyIndex) {
           activeSessionKey = sessionKeys[keyIndex];
-          reconnectAttempts = 0; // Success — reset retry counter
-          reconnectEnabled = false; // No more auto-reconnect needed
+          reconnectAttempts = 0;
+          reconnectEnabled = false;
           console.log('[BleManager] >>> AUTHENTICATED <<< Session key locked in.');
 
           const reply = buildControlPacket(0x10 | keyIndex);
@@ -445,7 +436,7 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
 
           handshakeCallbacks?.onAuthenticated();
 
-          // ── Activation: unlock display + send greeting ──
+          // Activate dashboard: navState ON + greeting
           activateDashboard(device);
         } else {
           console.error('[BleManager] Session key index out of range:', keyIndex);
@@ -457,62 +448,179 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
   }
 };
 
-// ─── Live Navigation Pipe ─────────────────────────────────────────────────────
+// ─── Full Navigation Pipeline ─────────────────────────────────────────────────
 /**
- * Routes real-time Google Maps data into the KTM dashboard.
- * Silently discards if the crypto handshake is not yet complete.
+ * Routes real-time Google Maps data into ALL KTM dash characteristics.
+ * This is the complete pipeline — TURN_ICON, TURN_DISTANCE, TURN_ROAD,
+ * TURN_INFO, ETA, and REMAINING_DISTANCE.
+ *
+ * @param data.distance           - "300 m", "1.2 km"    → TURN_DISTANCE (0705)
+ * @param data.road               - "MG Road"             → TURN_ROAD (0707)
+ * @param data.turnIcon           - TurnIcon enum value   → TURN_ICON (0704)
+ * @param data.maneuver           - "Turn left"           → TURN_INFO (0706)
+ * @param data.eta                - "12:45"               → ETA (0708)
+ * @param data.remainingDistance  - "23 km"               → REMAINING_DISTANCE (0709)
  */
-export const streamLiveNavigation = async (distance: string, road: string): Promise<void> => {
+export const streamLiveNavigation = async (data: {
+  distance: string;
+  road: string;
+  turnIcon: number;
+  maneuver: string;
+  eta: string;
+  remainingDistance: string;
+}): Promise<void> => {
   if (!activeSessionKey || !currentTempIv || !connectedDevice) {
-    // Not authenticated yet — drop silently
-    return;
+    return; // Not authenticated — drop silently
   }
 
-  // 1. Write distance to TURN_DISTANCE (0705)
-  if (distance.trim()) {
-    const distPayload = buildTurnDistancePayload(distance);
-    const encDist = frameAndEncryptData(distPayload, activeSessionKey, currentTempIv);
-    queuedWrite(
-      connectedDevice,
-      KTM_UUIDS.MAIN_SERVICE,
-      KTM_UUIDS.TURN_DISTANCE,
-      bytesToBase64(encDist),
-      'Nav: distance',
-    );
+  // Cancel greeting clear timer — real nav data is now flowing
+  if (greetingClearTimer) {
+    clearTimeout(greetingClearTimer);
+    greetingClearTimer = null;
   }
 
-  // 2. Write road name to TURN_ROAD (0707)
-  if (road.trim()) {
-    const roadPayload = buildTurnRoadPayload(road);
-    const encRoad = frameAndEncryptData(roadPayload, activeSessionKey, currentTempIv);
-    queuedWrite(
-      connectedDevice,
-      KTM_UUIDS.MAIN_SERVICE,
-      KTM_UUIDS.TURN_ROAD,
-      bytesToBase64(encRoad),
-      'Nav: road',
-    );
-  }
+  // --- TERMINAL LOGGING FOR INDOOR TESTING ---
+  console.log('\n=========================================');
+  console.log('[KTM DASHBOARD MAPPING]');
+  console.log(`1. TURN_ICON         (0704) : ${data.turnIcon}`);
+  console.log(`2. TURN_ROAD         (0707) : "${data.road}"`);
+  console.log(`3. TURN_INFO         (0706) : "${data.maneuver}"`);
+  console.log(`4. TURN_DISTANCE     (0705) : "${data.distance}"`);
+  console.log(`5. ETA               (0708) : "${data.eta}"`);
+  console.log(`6. REMAINING_DIST    (0709) : "${data.remainingDistance}"`);
+  console.log('=========================================\n');
+
+  // 1. TURN_ICON (0704) — the turn arrow
+  const iconPayload = buildTurnIconPayload(data.turnIcon, Visibility.FULL);
+  const encIcon = frameAndEncryptData(iconPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
+    bytesToBase64(encIcon), 'Nav: icon', true);
+
+  // 2. TURN_DISTANCE (0705) — distance to next turn
+  const distText = data.distance.trim();
+  const distPayload = buildTurnDistancePayload(distText, distText ? Visibility.FULL : Visibility.OFF);
+  const encDist = frameAndEncryptData(distPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
+    bytesToBase64(encDist), 'Nav: distance', true);
+
+  // 3. TURN_INFO (0706) — secondary maneuver text
+  const infoText = data.maneuver.trim();
+  const infoPayload = buildTurnInfoPayload(infoText, infoText ? Visibility.FULL : Visibility.OFF);
+  const encInfo = frameAndEncryptData(infoPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_INFO,
+    bytesToBase64(encInfo), 'Nav: maneuver', true);
+
+  // 4. TURN_ROAD (0707) — road/street name
+  const roadText = data.road.trim();
+  const roadPayload = buildTurnRoadPayload(roadText, roadText ? Visibility.FULL : Visibility.OFF);
+  const encRoad = frameAndEncryptData(roadPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
+    bytesToBase64(encRoad), 'Nav: road', true);
+
+  // 5. ETA (0708) — arrival time
+  const etaText = data.eta.trim();
+  const etaPayload = buildEtaPayload(etaText, etaText ? Visibility.FULL : Visibility.OFF);
+  const encEta = frameAndEncryptData(etaPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.ETA,
+    bytesToBase64(encEta), 'Nav: ETA', true);
+
+  // 6. REMAINING_DISTANCE (0709) — total remaining trip distance
+  const remText = data.remainingDistance.trim();
+  const remPayload = buildRemainingDistPayload(remText, remText ? Visibility.FULL : Visibility.OFF);
+  const encRem = frameAndEncryptData(remPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.REMAINING_DISTANCE,
+    bytesToBase64(encRem), 'Nav: remaining', true);
+};
+
+// ─── Guidance Clear ───────────────────────────────────────────────────────────
+/**
+ * Blank the dash's center guidance view — all 6 nav characteristics set to
+ * empty text + visibility OFF, turn icon set to UNDEFINED + OFF.
+ * Matches BikeConnect's disableGuidanceAndNotificationWidgets().
+ * BccuConnectionService.kt line 1376-1396.
+ *
+ * Call this when Google Maps navigation ends (notification removed).
+ */
+export const clearGuidance = (): void => {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) return;
+
+  console.log('[BleManager] Clearing center guidance (navigation ended)');
+
+  const off = Visibility.OFF;
+
+  // TURN_ICON → UNDEFINED + OFF
+  const iconPayload = buildTurnIconPayload(TurnIcon.UNDEFINED, off);
+  const encIcon = frameAndEncryptData(iconPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
+    bytesToBase64(encIcon), 'Clear: icon', true);
+
+  // TURN_DISTANCE → empty + OFF
+  const distPayload = buildTurnDistancePayload('', off);
+  const encDist = frameAndEncryptData(distPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
+    bytesToBase64(encDist), 'Clear: distance', true);
+
+  // TURN_INFO → empty + OFF
+  const infoPayload = buildTurnInfoPayload('', off);
+  const encInfo = frameAndEncryptData(infoPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_INFO,
+    bytesToBase64(encInfo), 'Clear: info', true);
+
+  // TURN_ROAD → empty + OFF
+  const roadPayload = buildTurnRoadPayload('', off);
+  const encRoad = frameAndEncryptData(roadPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
+    bytesToBase64(encRoad), 'Clear: road', true);
+
+  // ETA → empty + OFF
+  const etaPayload = buildEtaPayload('', off);
+  const encEta = frameAndEncryptData(etaPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.ETA,
+    bytesToBase64(encEta), 'Clear: ETA', true);
+
+  // REMAINING_DISTANCE → empty + OFF
+  const remPayload = buildRemainingDistPayload('', off);
+  const encRem = frameAndEncryptData(remPayload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.REMAINING_DISTANCE,
+    bytesToBase64(encRem), 'Clear: remaining', true);
 };
 
 // ─── Dashboard Notifications ──────────────────────────────────────────────────
-export const sendDashboardNotification = async (text: string): Promise<void> => {
+export const sendDashboardNotification = async (
+  text: string,
+  iconByte: number = NotificationIconType.INFORMATION,
+): Promise<void> => {
   if (!activeSessionKey || !currentTempIv || !connectedDevice) {
     console.error('[BleManager] Cannot send notification: not authenticated.');
     return;
   }
 
   if (text.trim()) {
-    const notifPayload = buildNotificationPayload(text);
+    const notifPayload = buildNotificationPayload(text, iconByte);
     const encNotif = frameAndEncryptData(notifPayload, activeSessionKey, currentTempIv);
     queuedWrite(
       connectedDevice,
       KTM_UUIDS.MAIN_SERVICE,
-      KTM_UUIDS.NOTIFICATION, // 070a
+      KTM_UUIDS.NOTIFICATION,
       bytesToBase64(encNotif),
       'Notification (070a)',
+      true,
     );
   }
+};
+
+/**
+ * Clear the notification banner.
+ * Confirmed from BccuConnectionService.kt clearNotificationDisplay():
+ * keep the last icon but flip visibility to OFF.
+ */
+export const clearNotificationBanner = (): void => {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) return;
+
+  const payload = buildNotificationPayload('', NotificationIconType.INFORMATION, Visibility.OFF);
+  const enc = frameAndEncryptData(payload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.NOTIFICATION,
+    bytesToBase64(enc), 'Clear: notification', true);
 };
 
 // ─── Manual Write Helper ──────────────────────────────────────────────────────

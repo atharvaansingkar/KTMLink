@@ -18,26 +18,40 @@ class MapScraperModule(private val reactContext: ReactApplicationContext) : Reac
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == MapScraperService.ACTION_MAPS_UPDATE) {
-                val title = intent.getStringExtra(MapScraperService.EXTRA_TITLE) ?: ""
-                val text = intent.getStringExtra(MapScraperService.EXTRA_TEXT) ?: ""
-                val iconBase64 = intent.getStringExtra(MapScraperService.EXTRA_ICON_BASE64) ?: ""
+            when (intent?.action) {
+                MapScraperService.ACTION_MAPS_UPDATE -> {
+                    val title = intent.getStringExtra(MapScraperService.EXTRA_TITLE) ?: ""
+                    val text = intent.getStringExtra(MapScraperService.EXTRA_TEXT) ?: ""
+                    val subText = intent.getStringExtra(MapScraperService.EXTRA_SUB_TEXT) ?: ""
+                    val bigText = intent.getStringExtra(MapScraperService.EXTRA_BIG_TEXT) ?: ""
+                    val iconBase64 = intent.getStringExtra(MapScraperService.EXTRA_ICON_BASE64) ?: ""
 
-                val params = Arguments.createMap().apply {
-                    putString("title", title)
-                    putString("text", text)
-                    putString("iconBase64", iconBase64)
+                    val params = Arguments.createMap().apply {
+                        putString("title", title)
+                        putString("text", text)
+                        putString("subText", subText)
+                        putString("bigText", bigText)
+                        putString("iconBase64", iconBase64)
+                    }
+
+                    reactContext
+                        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                        .emit("onMapUpdate", params)
                 }
-
-                reactContext
-                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-                    .emit("onMapUpdate", params)
+                MapScraperService.ACTION_MAPS_REMOVED -> {
+                    reactContext
+                        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                        .emit("onMapRemoved", null)
+                }
             }
         }
     }
 
     init {
-        val filter = IntentFilter(MapScraperService.ACTION_MAPS_UPDATE)
+        val filter = IntentFilter().apply {
+            addAction(MapScraperService.ACTION_MAPS_UPDATE)
+            addAction(MapScraperService.ACTION_MAPS_REMOVED)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             reactContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
