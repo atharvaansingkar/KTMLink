@@ -211,6 +211,60 @@ const queuedWrite = (
   }, coalesce ? charUuid : null);
 };
 
+// ─── Welcome Screen ───────────────────────────────────────────────────────────
+/**
+ * Show the permanent welcome state on the KTM dash.
+ * Clears the 4 stale detail fields first (space + OFF prevents the dash from
+ * keeping old rendered values), then sets the greeting and START icon.
+ * All writes bypass coalescing so they can never be dropped by incoming nav data.
+ */
+export const showWelcomeScreen = (): void => {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) return;
+
+  console.log('[BleManager] Showing welcome screen');
+
+  // Drain any pending coalesced display writes — prevents a late nav update from
+  // overwriting the welcome state immediately after this call.
+  for (let i = gattQueue.length - 1; i >= 0; i--) {
+    if (gattQueue[i].coalesceKey !== null) {
+      console.log(`[GattQueue] Flushing stale display write: ${gattQueue[i].label}`);
+      gattQueue.splice(i, 1);
+    }
+  }
+
+  const off = Visibility.OFF;
+  const d = connectedDevice;
+  const key = activeSessionKey;
+  const iv = currentTempIv;
+
+  // Clear the 4 detail fields — space + OFF forces the dash to blank them
+  const distPayload = buildTurnDistancePayload(' ', off);
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
+    bytesToBase64(frameAndEncryptData(distPayload, key, iv)), 'Welcome: clear distance');
+
+  const infoPayload = buildTurnInfoPayload(' ', off);
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_INFO,
+    bytesToBase64(frameAndEncryptData(infoPayload, key, iv)), 'Welcome: clear info');
+
+  const etaPayload = buildEtaPayload(' ', off);
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.ETA,
+    bytesToBase64(frameAndEncryptData(etaPayload, key, iv)), 'Welcome: clear ETA');
+
+  const remPayload = buildRemainingDistPayload(' ', off);
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.REMAINING_DISTANCE,
+    bytesToBase64(frameAndEncryptData(remPayload, key, iv)), 'Welcome: clear remaining');
+
+  // Road name first — panel stays visible while icon swaps
+  const roadPayload = buildTurnRoadPayload('Hello Atharva!');
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
+    bytesToBase64(frameAndEncryptData(roadPayload, key, iv)), 'Welcome: greeting');
+
+  // Icon last — single visible transition, no blank frame
+  const iconPayload = buildTurnIconPayload(TurnIcon.START, Visibility.FULL);
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
+    bytesToBase64(frameAndEncryptData(iconPayload, key, iv)), 'Welcome: START icon');
+};
+
 // ─── Activation Sequence ──────────────────────────────────────────────────────
 const activateDashboard = (device: Device) => {
   if (!activeSessionKey || !currentTempIv) {
@@ -218,39 +272,17 @@ const activateDashboard = (device: Device) => {
     return;
   }
 
-  // 1. Unlock display engine: guidanceOn + gpsIconOn
-  //    The dash requires this before it will render TURN_ICON/TURN_ROAD content.
-  //    Confirmed from BccuConnectionService.kt line 967.
+  // Unlock display engine: guidanceOn + gpsIconOn
+  // The dash requires this before it will render TURN_ICON/TURN_ROAD content.
+  // Confirmed from BccuConnectionService.kt line 967.
   const navStatePayload = buildNavigationStatePayload(true, true);
   const encNavState = frameAndEncryptData(navStatePayload, activeSessionKey, currentTempIv);
   queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.NAVIGATION_STATE,
     bytesToBase64(encNavState), 'NavState: guidance ON');
 
-  // 2. Show START icon + greeting on the center display
-  //    Matches BccuConnectionService.kt sendGreeting() line 1282-1302
-  const iconPayload = buildTurnIconPayload(TurnIcon.START, Visibility.FULL);
-  const encIcon = frameAndEncryptData(iconPayload, activeSessionKey, currentTempIv);
-  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
-    bytesToBase64(encIcon), 'Greeting: START icon', true);
-
-  const greetingPayload = buildTurnRoadPayload('Hello Atharva!');
-  const encGreeting = frameAndEncryptData(greetingPayload, activeSessionKey, currentTempIv);
-  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
-    bytesToBase64(encGreeting), 'Greeting: road text', true);
-
-  // 3. Hide distance during greeting (visibility OFF)
-  const emptyDist = buildTurnDistancePayload('', Visibility.OFF);
-  const encEmptyDist = frameAndEncryptData(emptyDist, activeSessionKey, currentTempIv);
-  queuedWrite(device, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
-    bytesToBase64(encEmptyDist), 'Greeting: hide distance', true);
-
-  // 4. Auto-clear greeting after 6 seconds (replaced by real nav if it arrives sooner)
-  greetingClearTimer = setTimeout(() => {
-    clearGuidance();
-  }, 6000);
+  // Show welcome screen — stays permanently until real nav arrives
+  showWelcomeScreen();
 };
-
-let greetingClearTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ─── Auto-Reconnect on Disconnect ─────────────────────────────────────────────
 const handleBleDisconnect = (deviceId: string) => {
@@ -311,8 +343,6 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
     gattBusy = false;
     reconnectTargetId = deviceId;
     reconnectEnabled = true;
-    if (greetingClearTimer) { clearTimeout(greetingClearTimer); greetingClearTimer = null; }
-
     stopScan();
 
     const device = await bleManager.connectToDevice(deviceId);
@@ -328,6 +358,11 @@ export const connectToDevice = async (deviceId: string): Promise<string[]> => {
 
     await device.requestMTU(517);
     console.log('[BleManager] MTU expanded to 517.');
+
+    // Shorten BLE connection interval to HIGH (7.5ms) — confirmed from z45.java.
+    // Without this, 6 sequential GATT writes at the default ~30ms interval = ~180ms per nav update.
+    await device.requestConnectionPriority(1).catch(() => {});
+    console.log('[BleManager] Connection priority set to HIGH.');
 
     if (device.name?.includes('KTM')) {
       connectedDevice = device;
@@ -471,12 +506,6 @@ export const streamLiveNavigation = async (data: {
 }): Promise<void> => {
   if (!activeSessionKey || !currentTempIv || !connectedDevice) {
     return; // Not authenticated — drop silently
-  }
-
-  // Cancel greeting clear timer — real nav data is now flowing
-  if (greetingClearTimer) {
-    clearTimeout(greetingClearTimer);
-    greetingClearTimer = null;
   }
 
   // --- TERMINAL LOGGING FOR INDOOR TESTING ---

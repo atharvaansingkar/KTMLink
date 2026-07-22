@@ -8,7 +8,6 @@ import {
   ScrollView,
   StatusBar,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -21,7 +20,7 @@ import {
   shootData,
   setHandshakeCallbacks,
   streamLiveNavigation,
-  clearGuidance,
+  showWelcomeScreen,
 } from './src/services/BleManager';
 import { parseNavNotification, isUsefulNavData } from './src/services/NavParser';
 
@@ -73,9 +72,6 @@ const App = () => {
   const [hasPermission, setHasPermission] = useState(false);
   const [lastUpdated, setLastUpdated]     = useState<string | null>(null);
 
-  // Debounce timer for clearing guidance
-  const clearGuidanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   // BLE state
   const [savedKtmDevice, setSavedKtmDevice] = useState<{id: string; name: string} | null>(null);
   const [connectedDeviceId, setConnectedDeviceId] = useState<string | null>(null);
@@ -88,9 +84,6 @@ const App = () => {
   // UUID debug log (raw) — kept hidden by default
   const [rawUuids, setRawUuids]           = useState<string[]>([]);
   const [showRawUuids, setShowRawUuids]   = useState(false);
-
-  // Live dashboard sync toggle
-  const [liveSyncEnabled, setLiveSyncEnabled] = useState(true);
 
   // Write test state
   const [testPayload, setTestPayload]     = useState('Hello Dash');
@@ -179,18 +172,12 @@ const App = () => {
       onAuthenticated:  ()     => { setStep('authenticated'); setConnectionStatus('connected'); },
     });
 
-    // Maps notifications — also pipe to BLE if sync is enabled
+    // Maps notifications — pipe to BLE whenever connected
     const subUpdate = mapScraperEmitter.addListener(
       'onMapUpdate',
       (event: {title: string; text: string; subText: string; bigText: string; iconBase64: string}) => {
         const {title = '', text = '', subText = '', bigText = ''} = event;
         if (!isUsefulNavData(title, text)) return;
-        
-        // Clear any pending guidance clear timer
-        if (clearGuidanceTimer.current) {
-          clearTimeout(clearGuidanceTimer.current);
-          clearGuidanceTimer.current = null;
-        }
 
         const parsed = parseNavNotification(title, text, subText, bigText);
 
@@ -204,20 +191,13 @@ const App = () => {
         setLastUpdated(new Date().toLocaleTimeString());
         flashCard();
 
-        // Route to dashboard if sync is on
-        if (liveSyncEnabled) {
-          streamLiveNavigation(parsed);
-        }
+        streamLiveNavigation(parsed);
       },
     );
 
     const subRemoved = mapScraperEmitter.addListener('onMapRemoved', () => {
-      console.log('[App] onMapRemoved event received, clearing immediately');
-      if (clearGuidanceTimer.current) {
-        clearTimeout(clearGuidanceTimer.current);
-        clearGuidanceTimer.current = null;
-      }
-      
+      console.log('[App] onMapRemoved — restoring welcome screen');
+
       setNavTitle('');
       setNavText('Navigation Ended');
       setNavDistance('');
@@ -225,18 +205,15 @@ const App = () => {
       setNavEta('');
       setNavRemaining('');
       setNavIconName('');
-      
-      if (liveSyncEnabled) {
-        clearGuidance();
-      }
+
+      showWelcomeScreen();
     });
 
     return () => {
       subUpdate.remove();
       subRemoved.remove();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveSyncEnabled]);
+  }, []);
 
   // Handlers
   const handleGrantPermission = () => MapScraper?.requestPermission?.();
@@ -343,21 +320,6 @@ const App = () => {
           {lastUpdated && <Text style={styles.timestamp}>Last update: {lastUpdated}</Text>}
           <View style={styles.filterBadge}>
             <Text style={styles.filterBadgeText}>🔍 JUNK FILTER ACTIVE</Text>
-          </View>
-          {/* LIVE DASHBOARD SYNC toggle */}
-          <View style={styles.syncRow}>
-            <View style={styles.syncLabelWrap}>
-              <Text style={styles.syncLabel}>LIVE DASHBOARD SYNC</Text>
-              <Text style={styles.syncSub}>
-                {liveSyncEnabled ? 'Routing nav to KTM display' : 'Paused — data not sent to bike'}
-              </Text>
-            </View>
-            <Switch
-              value={liveSyncEnabled}
-              onValueChange={setLiveSyncEnabled}
-              trackColor={{false: '#2a2a2a', true: '#FF6600'}}
-              thumbColor={liveSyncEnabled ? '#FFFFFF' : '#555'}
-            />
           </View>
         </Animated.View>
 
@@ -536,11 +498,6 @@ const styles = StyleSheet.create({
   timestamp:    {fontSize: 10, color: '#444', marginBottom: 10, marginTop: 14},
   filterBadge:  {alignSelf: 'flex-start', backgroundColor: '#1a1a1a', borderWidth: 1, borderColor: '#2e2e2e', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3},
   filterBadgeText: {fontSize: 9, color: '#FF6600', fontWeight: '700', letterSpacing: 1},
-
-  syncRow:       {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 14, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#1e1e1e'},
-  syncLabelWrap: {flex: 1, marginRight: 12},
-  syncLabel:     {fontSize: 10, fontWeight: '700', letterSpacing: 2, color: '#FF6600'},
-  syncSub:       {fontSize: 10, color: '#555', marginTop: 2},
 
   // Permission btn
   permButton:     {backgroundColor: '#FF6600', borderRadius: 12, paddingVertical: 14, alignItems: 'center', marginBottom: 12},
