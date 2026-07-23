@@ -89,6 +89,10 @@ App  ──echo CMD_SELECT_KEY back───────────────
 **Auth characteristics:** `AUTH_REQ = 0701` (bike→app indications), `AUTH_REP = 0702` (app→bike writes).
 
 **Control packets** (`buildControlPacket`): 16 random bytes, `[2]=0xFF`, `[4]=cmd`, `[6]=0x01`. Encrypted with raw AES-CBC (no framing) using `encryptControl/decryptControl`.
+**IMPORTANT — asymmetric cmd byte positions confirmed on physical bike:**
+- Bike → App packets: command is at **byte `[2]`** of the decrypted 16 bytes.
+- App → Bike packets (`buildControlPacket`): command is at **byte `[4]`**, `[2]=0xFF` is a marker.
+- These are intentionally different. Read `[2]` when parsing bike packets. Write `[4]` when building replies.
 
 ---
 

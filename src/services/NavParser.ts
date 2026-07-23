@@ -29,14 +29,17 @@ export interface ParsedNavData {
   /** Turn icon name for debug logging */
   turnIconName: string;
 
-  /** Raw maneuver text, e.g. "Turn left" — useful for TURN_INFO (0706) */
+  /** Turn instruction, e.g. "Turn left", "Keep right" — sent to TURN_INFO (0706) */
   maneuver: string;
 
-  /** Arrival time, e.g. "12:45" — sent to ETA (0708) */
+  /** Arrival time, e.g. "12:45pm" — sent to ETA (0708) */
   eta: string;
 
-  /** Total remaining distance, e.g. "23 km" — sent to REMAINING_DISTANCE (0709) */
+  /** Total remaining distance, e.g. "23 km" — combined with timeRemaining for REMAINING_DISTANCE (0709) marquee */
   remainingDistance: string;
+
+  /** Time remaining, e.g. "28 min", "1 hr 5 min" — combined with remainingDistance for REMAINING_DISTANCE marquee */
+  timeRemaining: string;
 }
 
 // ─── Junk Filter ──────────────────────────────────────────────────────────────
@@ -108,6 +111,16 @@ export const parseNavNotification = (
     }
   }
 
+  // Fallback: search bigText for "In X m/km" — handles newer Maps versions that put distance
+  // only in RemoteViews (scraped to bigText) and leave EXTRA_TEXT as road/maneuver only.
+  // We require the "In" prefix so we don't accidentally pick up remaining distance ("8.1 km").
+  if (!distance && bigText) {
+    const bigDistMatch = bigText.match(/\bIn\s+(\d[\d.,]*\s*(?:m|km|mi|ft))\b/i);
+    if (bigDistMatch) {
+      distance = bigDistMatch[1].trim();
+    }
+  }
+
   // Strip leading separators (e.g., bullet points, dashes, commas left after removing distance)
   remainder = remainder.replace(/^[\s•\-,·.]+/, '').trim();
 
@@ -117,17 +130,21 @@ export const parseNavNotification = (
   
   const ontoMatch = remainder.match(/(?:^|\s+)(?:onto|on|towards|toward|to)\s+/i);
   if (ontoMatch && ontoMatch.index !== undefined) {
-    // Split into maneuver and road
     maneuver = remainder.substring(0, ontoMatch.index).trim();
     road = remainder.substring(ontoMatch.index + ontoMatch[0].length).trim();
   } else {
-    // No "onto" found. Is it an action verb or just a road name?
     if (/^(?:Turn|Keep|Take|Head|Continue|Merge|Exit|Arrive)\b/i.test(remainder)) {
       maneuver = remainder;
     } else {
       road = remainder;
     }
   }
+
+  // Strip trailing qualifiers from maneuver — "Turn left after 500 m" → "Turn left"
+  // These phrases add no value in a 16-char slot and cause truncation with "..."
+  maneuver = maneuver
+    .replace(/\s+(?:after|before|at|in|onto|on|towards|toward)\s+.*/i, '')
+    .trim();
 
   // 3. Turn Icon
   // Must use combinedText to catch "Turn left" if it was in the title!
@@ -158,43 +175,40 @@ export const parseNavNotification = (
       remainingDistance = remMatch[1].trim();
     }
     
-    // Time remaining: e.g. "5 min", "1 hr 5 min"
-    const timeRemMatch = remSource.match(/\b(\d+\s*(?:hr|h|hrs)\s*\d*\s*(?:min|m)?|\d+\s*(?:min|m))\b/i);
+    // Time remaining: match "28 min", "1 hr 5 min", "2h 30m" — but NOT "km" or "9.3 km"
+    // Require the time unit to be a standalone word, not part of "km"
+    const timeRemMatch = remSource.match(
+      /\b(\d+\s*(?:hrs?|h)\s*\d*\s*(?:min)?|\d+\s*min)\b/i,
+    );
     if (timeRemMatch) {
-      const tr = timeRemMatch[1].trim();
-      if (tr.includes('min') || tr.includes('hr') || tr.includes('h')) {
-        timeRemaining = tr;
-      } else if (tr.endsWith('m') && !remSource.includes(tr + 'i')) { // Not 'mi'
-        timeRemaining = tr;
-      }
+      timeRemaining = timeRemMatch[1].trim();
     }
   }
 
-  // If timeRemaining is STILL empty, try calculating it from ETA (if ETA is today)
+  // If timeRemaining is STILL empty, calculate from ETA minus current time
   if (!timeRemaining && eta) {
     try {
       const now = new Date();
       let [timeStr, modifier] = eta.toLowerCase().split(/(am|pm)/);
       timeStr = timeStr.trim();
       let [hours, minutes] = timeStr.split(':').map(Number);
-      
+
       if (modifier === 'pm' && hours < 12) hours += 12;
       if (modifier === 'am' && hours === 12) hours = 0;
-      
+
       const etaTime = new Date();
       etaTime.setHours(hours, minutes, 0, 0);
-      
-      // If ETA is tomorrow
       if (etaTime.getTime() < now.getTime()) {
         etaTime.setDate(etaTime.getDate() + 1);
       }
-      
-      let diffMins = Math.floor((etaTime.getTime() - now.getTime()) / 60000);
+
+      const diffMins = Math.floor((etaTime.getTime() - now.getTime()) / 60000);
       if (diffMins > 0) {
-        if (diffMins > 60) {
+        if (diffMins >= 60) {
           const h = Math.floor(diffMins / 60);
           const m = diffMins % 60;
-          timeRemaining = `${h} hr ${m} min`;
+          // Compact format — must fit 8 chars: "1h 5min" (7), "10h 5min" (8)
+          timeRemaining = m > 0 ? `${h}h ${m}min` : `${h}h`;
         } else {
           timeRemaining = `${diffMins} min`;
         }
@@ -202,11 +216,6 @@ export const parseNavNotification = (
     } catch(e) {
       // Ignored
     }
-  }
-
-  // If the user wants time remaining in TURN_INFO, let's prioritize it and REMOVE the maneuver text completely
-  if (timeRemaining) {
-    maneuver = timeRemaining;
   }
 
   return {
@@ -217,5 +226,6 @@ export const parseNavNotification = (
     maneuver,
     eta,
     remainingDistance,
+    timeRemaining,
   };
 };

@@ -106,7 +106,7 @@ const MAPPING_RULES: MappingRule[] = [
   // ── U-turns ──
   { pattern: /u.?turn.*(?:left|लेफ्ट|बाएं)/i,               icon: TurnIcon.UTURN_LEFT },
   { pattern: /u.?turn.*(?:right|राइट|दाएं)/i,               icon: TurnIcon.UTURN_RIGHT },
-  { pattern: /u.?turn/i,                                     icon: TurnIcon.UTURN_LEFT },  // default U-turn
+  { pattern: /u.?turn/i,                                     icon: TurnIcon.UTURN_RIGHT }, // India drives on left → U swings right
 
   // ── Roundabouts (must check before generic turns) ──
   { pattern: /roundabout|traffic\s*circle|rotary|चक्कर/i,    icon: TurnIcon.GO_STRAIGHT }, // placeholder; overridden in mapper function

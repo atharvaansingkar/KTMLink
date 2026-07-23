@@ -7,11 +7,16 @@ export const bleManager = new BleManager();
 export const requestBluetoothPermissions = async (): Promise<boolean> => {
   if (Platform.OS === 'android') {
     if (Platform.Version >= 31) {
-      const result = await PermissionsAndroid.requestMultiple([
+      const perms: any[] = [
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
+      ];
+      // POST_NOTIFICATIONS required on Android 13+ (API 33) to show the service notification
+      if (Platform.Version >= 33) {
+        perms.push('android.permission.POST_NOTIFICATIONS');
+      }
+      const result = await PermissionsAndroid.requestMultiple(perms);
       return (
         result['android.permission.BLUETOOTH_CONNECT'] === PermissionsAndroid.RESULTS.GRANTED &&
         result['android.permission.BLUETOOTH_SCAN'] === PermissionsAndroid.RESULTS.GRANTED &&
@@ -221,6 +226,7 @@ const queuedWrite = (
 export const showWelcomeScreen = (): void => {
   if (!activeSessionKey || !currentTempIv || !connectedDevice) return;
 
+  stopMarquee();
   console.log('[BleManager] Showing welcome screen');
 
   // Drain any pending coalesced display writes — prevents a late nav update from
@@ -263,6 +269,71 @@ export const showWelcomeScreen = (): void => {
   const iconPayload = buildTurnIconPayload(TurnIcon.START, Visibility.FULL);
   queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
     bytesToBase64(frameAndEncryptData(iconPayload, key, iv)), 'Welcome: START icon');
+};
+
+// ─── Remaining Distance Alternating Display ───────────────────────────────────
+// Alternates between remaining distance and remaining time every 2 seconds.
+// Each value fits cleanly in 8 chars on its own — no truncation, fully readable.
+// If only one value is available, writes it once as a static value.
+
+const ALT_INTERVAL_MS = 2000;
+
+let altTimer: ReturnType<typeof setInterval> | null = null;
+let altDistText = '';
+let altTimeText = '';
+
+const writeRemainingSlot = (text: string) => {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) return;
+  const vis = text ? Visibility.FULL : Visibility.OFF;
+  const payload = buildRemainingDistPayload(text, vis);
+  const enc = frameAndEncryptData(payload, activeSessionKey, currentTempIv);
+  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.REMAINING_DISTANCE,
+    bytesToBase64(enc), 'Slot6: remaining', true);
+};
+
+const stopMarquee = () => {
+  if (altTimer) {
+    clearInterval(altTimer);
+    altTimer = null;
+  }
+  altDistText = '';
+  altTimeText = '';
+};
+
+export const startRemainingMarquee = (distText: string, timeText: string): void => {
+  if (!distText && !timeText) { stopMarquee(); return; }
+
+  // Only one value — static write, no alternation needed
+  if (!distText || !timeText) {
+    // Still restart if the single value changed
+    if (distText !== altDistText || timeText !== altTimeText) {
+      stopMarquee();
+      altDistText = distText;
+      altTimeText = timeText;
+      writeRemainingSlot(distText || timeText);
+    }
+    return;
+  }
+
+  // Both values present — only (re)start the timer if the values changed.
+  // Google Maps fires notifications every ~1s; without this guard the timer
+  // is reset on every notification and never reaches the 2s mark.
+  if (distText === altDistText && timeText === altTimeText && altTimer !== null) {
+    return; // values unchanged, timer already running — leave it alone
+  }
+
+  stopMarquee();
+  altDistText = distText;
+  altTimeText = timeText;
+
+  let showingDist = true;
+  writeRemainingSlot(distText);
+
+  altTimer = setInterval(() => {
+    if (!activeSessionKey) { stopMarquee(); return; }
+    showingDist = !showingDist;
+    writeRemainingSlot(showingDist ? altDistText : altTimeText);
+  }, ALT_INTERVAL_MS);
 };
 
 // ─── Activation Sequence ──────────────────────────────────────────────────────
@@ -493,8 +564,9 @@ const handleAuthIndication = async (device: Device, rawBytes: Uint8Array) => {
  * @param data.road               - "MG Road"             → TURN_ROAD (0707)
  * @param data.turnIcon           - TurnIcon enum value   → TURN_ICON (0704)
  * @param data.maneuver           - "Turn left"           → TURN_INFO (0706)
- * @param data.eta                - "12:45"               → ETA (0708)
- * @param data.remainingDistance  - "23 km"               → REMAINING_DISTANCE (0709)
+ * @param data.eta                - "12:45pm"             → ETA (0708)
+ * @param data.remainingDistance  - "23 km"               → REMAINING_DISTANCE (0709) marquee
+ * @param data.timeRemaining      - "28 min"              → combined into REMAINING_DISTANCE marquee
  */
 export const streamLiveNavigation = async (data: {
   distance: string;
@@ -503,12 +575,12 @@ export const streamLiveNavigation = async (data: {
   maneuver: string;
   eta: string;
   remainingDistance: string;
+  timeRemaining: string;
 }): Promise<void> => {
   if (!activeSessionKey || !currentTempIv || !connectedDevice) {
     return; // Not authenticated — drop silently
   }
 
-  // --- TERMINAL LOGGING FOR INDOOR TESTING ---
   console.log('\n=========================================');
   console.log('[KTM DASHBOARD MAPPING]');
   console.log(`1. TURN_ICON         (0704) : ${data.turnIcon}`);
@@ -516,49 +588,46 @@ export const streamLiveNavigation = async (data: {
   console.log(`3. TURN_INFO         (0706) : "${data.maneuver}"`);
   console.log(`4. TURN_DISTANCE     (0705) : "${data.distance}"`);
   console.log(`5. ETA               (0708) : "${data.eta}"`);
-  console.log(`6. REMAINING_DIST    (0709) : "${data.remainingDistance}"`);
+  console.log(`6. REMAINING_DIST    (0709) : "${data.remainingDistance}" / "${data.timeRemaining}" (alternating)`);
   console.log('=========================================\n');
 
-  // 1. TURN_ICON (0704) — the turn arrow
+  // 1. TURN_ICON (0704)
   const iconPayload = buildTurnIconPayload(data.turnIcon, Visibility.FULL);
   const encIcon = frameAndEncryptData(iconPayload, activeSessionKey, currentTempIv);
   queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
     bytesToBase64(encIcon), 'Nav: icon', true);
 
-  // 2. TURN_DISTANCE (0705) — distance to next turn
+  // 2. TURN_DISTANCE (0705)
   const distText = data.distance.trim();
   const distPayload = buildTurnDistancePayload(distText, distText ? Visibility.FULL : Visibility.OFF);
   const encDist = frameAndEncryptData(distPayload, activeSessionKey, currentTempIv);
   queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
     bytesToBase64(encDist), 'Nav: distance', true);
 
-  // 3. TURN_INFO (0706) — secondary maneuver text
-  const infoText = data.maneuver.trim();
+  // 3. TURN_INFO (0706) — "· Turn left" format matching official KTM Connect app
+  const infoRaw = data.maneuver.trim();
+  const infoText = infoRaw ? `· ${infoRaw}` : '';
   const infoPayload = buildTurnInfoPayload(infoText, infoText ? Visibility.FULL : Visibility.OFF);
   const encInfo = frameAndEncryptData(infoPayload, activeSessionKey, currentTempIv);
   queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_INFO,
     bytesToBase64(encInfo), 'Nav: maneuver', true);
 
-  // 4. TURN_ROAD (0707) — road/street name
+  // 4. TURN_ROAD (0707)
   const roadText = data.road.trim();
   const roadPayload = buildTurnRoadPayload(roadText, roadText ? Visibility.FULL : Visibility.OFF);
   const encRoad = frameAndEncryptData(roadPayload, activeSessionKey, currentTempIv);
   queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
     bytesToBase64(encRoad), 'Nav: road', true);
 
-  // 5. ETA (0708) — arrival time
+  // 5. ETA (0708)
   const etaText = data.eta.trim();
   const etaPayload = buildEtaPayload(etaText, etaText ? Visibility.FULL : Visibility.OFF);
   const encEta = frameAndEncryptData(etaPayload, activeSessionKey, currentTempIv);
   queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.ETA,
     bytesToBase64(encEta), 'Nav: ETA', true);
 
-  // 6. REMAINING_DISTANCE (0709) — total remaining trip distance
-  const remText = data.remainingDistance.trim();
-  const remPayload = buildRemainingDistPayload(remText, remText ? Visibility.FULL : Visibility.OFF);
-  const encRem = frameAndEncryptData(remPayload, activeSessionKey, currentTempIv);
-  queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.REMAINING_DISTANCE,
-    bytesToBase64(encRem), 'Nav: remaining', true);
+  // 6. REMAINING_DISTANCE (0709) — alternates distance and time every 2s
+  startRemainingMarquee(data.remainingDistance.trim(), data.timeRemaining.trim());
 };
 
 // ─── Guidance Clear ───────────────────────────────────────────────────────────
@@ -650,6 +719,40 @@ export const clearNotificationBanner = (): void => {
   const enc = frameAndEncryptData(payload, activeSessionKey, currentTempIv);
   queuedWrite(connectedDevice, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.NOTIFICATION,
     bytesToBase64(enc), 'Clear: notification', true);
+};
+
+// ─── Icon Test Helper ─────────────────────────────────────────────────────────
+/**
+ * Send a specific turn icon + label to the dash for testing.
+ * Replaces the icon and TURN_ROAD text; leaves all 4 detail fields blank.
+ * Call showWelcomeScreen() to return to the normal welcome state.
+ */
+export const sendTestIcon = (iconValue: number, iconLabel: string): void => {
+  if (!activeSessionKey || !currentTempIv || !connectedDevice) return;
+
+  const key = activeSessionKey;
+  const iv = currentTempIv;
+  const d = connectedDevice;
+
+  const off = Visibility.OFF;
+
+  // Blank the 4 detail fields
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_DISTANCE,
+    bytesToBase64(frameAndEncryptData(buildTurnDistancePayload(' ', off), key, iv)), 'Test: clear distance');
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_INFO,
+    bytesToBase64(frameAndEncryptData(buildTurnInfoPayload(' ', off), key, iv)), 'Test: clear info');
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.ETA,
+    bytesToBase64(frameAndEncryptData(buildEtaPayload(' ', off), key, iv)), 'Test: clear ETA');
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.REMAINING_DISTANCE,
+    bytesToBase64(frameAndEncryptData(buildRemainingDistPayload(' ', off), key, iv)), 'Test: clear remaining');
+
+  // Road line = icon name
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ROAD,
+    bytesToBase64(frameAndEncryptData(buildTurnRoadPayload(iconLabel), key, iv)), 'Test: icon label');
+
+  // Icon
+  queuedWrite(d, KTM_UUIDS.MAIN_SERVICE, KTM_UUIDS.TURN_ICON,
+    bytesToBase64(frameAndEncryptData(buildTurnIconPayload(iconValue, Visibility.FULL), key, iv)), 'Test: icon');
 };
 
 // ─── Manual Write Helper ──────────────────────────────────────────────────────
