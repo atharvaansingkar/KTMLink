@@ -15,6 +15,8 @@ object KtmNativeProtocol {
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     val MAIN_SERVICE:       UUID = uuid("0700")
+    val RCM_SERVICE:        UUID = uuid("0100")
+    val RCM_REMOTE_CONTROL: UUID = uuid("0103")  // Remote control indication
     val AUTH_REQ:           UUID = uuid("0701")  // Bike → App, indications
     val AUTH_REP:           UUID = uuid("0702")  // App → Bike, write
     val NAVIGATION_STATE:   UUID = uuid("0703")  // guidanceOn + gpsIcon
@@ -25,6 +27,7 @@ object KtmNativeProtocol {
     val ETA:                UUID = uuid("0708")  // Arrival time (max 8 chars)
     val REMAINING_DISTANCE: UUID = uuid("0709")  // Total remaining distance (max 8 chars)
     val NOTIFICATION:       UUID = uuid("070a")  // Bottom banner notification
+    val TBT_NAV_REQUEST:    UUID = uuid("070b")  // Turn-by-turn nav notifications
 
     // ── Visibility enum ──────────────────────────────────────────────────────
     // Confirmed from BccuProtocol.kt and com.ktm.mob.services.etbt.Visibility.binary()

@@ -44,6 +44,14 @@
           </intent-filter>
       </receiver>
 
+      <!-- Receives background BLE scan results via PendingIntent — wakes service
+           even when app process is fully dead (auto-launch from killed state). -->
+      <receiver android:name=".KtmBleScanReceiver" android:exported="true">
+          <intent-filter>
+              <action android:name="com.ktmlink.ACTION_BLE_SCAN_RESULT" />
+          </intent-filter>
+      </receiver>
+
       <activity
         android:name=".MainActivity"
         android:label="@string/app_name"

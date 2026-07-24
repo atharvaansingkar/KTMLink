@@ -99,6 +99,7 @@ class KTMLinkForegroundService : Service() {
     private val writeQueue = ArrayDeque<WriteEntry>()
     private var writeInFlight = false
     private var currentWriteOnDone: (() -> Unit)? = null
+    private var currentWriteIsDescriptor = false
 
     private fun enqueueWrite(
         label: String,
@@ -118,6 +119,7 @@ class KTMLinkForegroundService : Service() {
     private fun onWriteComplete(onDone: (() -> Unit)?) {
         gattHandler.post {
             writeInFlight = false
+            currentWriteIsDescriptor = false
             onDone?.invoke()
             drainQueue()
         }
@@ -145,12 +147,21 @@ class KTMLinkForegroundService : Service() {
         writeQueue.clear()
         writeInFlight = false
         currentWriteOnDone = null
+        currentWriteIsDescriptor = false
     }
 
     // ── GATT callbacks ────────────────────────────────────────────────────────
     private val gattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            // Discard late callbacks from a GATT client we already recycled.
+            // bluetoothGatt is nulled before old?.close() in closeGatt(), so a
+            // stale client arrives here with gatt !== bluetoothGatt.
+            if (gatt !== bluetoothGatt && newState != BluetoothProfile.STATE_CONNECTED) {
+                Log.d(TAG, "Ignoring state change from stale GATT client (status=$status newState=$newState)")
+                try { gatt.close() } catch (_: Exception) {}
+                return
+            }
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.d(TAG, "GATT connected — discovering services")
@@ -170,8 +181,6 @@ class KTMLinkForegroundService : Service() {
                     KTMLinkServiceModule.emitEvent("DISCONNECTED")
                     mainHandler.post {
                         updateNotification("KTMLink — Searching for KTM...")
-                        // Scan-first reconnect: direct connectGatt to an off-bike fails with
-                        // status 133/255. Scan and wait until the dash actually advertises.
                         scheduleReconnectScan()
                     }
                 }
@@ -179,18 +188,17 @@ class KTMLinkForegroundService : Service() {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (gatt !== bluetoothGatt) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "Services discovered — requesting MTU 517")
                 gatt.requestMtu(517)
-                if (gatt.getService(KtmNativeProtocol.MAIN_SERVICE) != null) {
-                    enableAuthReqIndications(gatt)
-                }
             } else {
                 Log.w(TAG, "onServicesDiscovered failed status=$status")
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (gatt !== bluetoothGatt) return
             Log.d(TAG, "MTU changed to $mtu (status=$status)")
             gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
             if (gatt.getService(KtmNativeProtocol.MAIN_SERVICE) != null) {
@@ -199,19 +207,21 @@ class KTMLinkForegroundService : Service() {
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            if (descriptor.characteristic.uuid == KtmNativeProtocol.AUTH_REQ &&
-                descriptor.uuid == KtmNativeProtocol.CCCD) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d(TAG, "AUTH_REQ indications enabled — waiting for M1")
-                } else {
-                    Log.w(TAG, "CCCD write failed status=$status")
-                }
+            if (gatt !== bluetoothGatt) return
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "onDescriptorWrite FAILED uuid=${descriptor.characteristic.uuid} status=$status")
+            } else if (descriptor.characteristic.uuid == KtmNativeProtocol.AUTH_REQ) {
+                Log.d(TAG, "AUTH_REQ indications enabled — waiting for M1")
             }
+            val done = currentWriteOnDone
+            currentWriteOnDone = null
+            onWriteComplete(done)
         }
 
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            if (gatt !== bluetoothGatt) return
             if (characteristic.uuid == KtmNativeProtocol.AUTH_REQ) {
                 handleAuthPacket(gatt, characteristic.value ?: return)
             }
@@ -222,6 +232,7 @@ class KTMLinkForegroundService : Service() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (gatt !== bluetoothGatt) return
             if (characteristic.uuid == KtmNativeProtocol.AUTH_REQ) {
                 handleAuthPacket(gatt, value)
             }
@@ -232,6 +243,7 @@ class KTMLinkForegroundService : Service() {
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (gatt !== bluetoothGatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.w(TAG, "onCharacteristicWrite FAILED uuid=${characteristic.uuid} status=$status")
                 emitLog("WRITE FAILED uuid=${characteristic.uuid.toString().takeLast(6)} status=$status")
@@ -269,7 +281,6 @@ class KTMLinkForegroundService : Service() {
 
         val savedMac = prefs().getString(PREFS_DEVICE_MAC, null)
         
-        val adapter = (getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
         val hasConnectPerm = ContextCompat.checkSelfPermission(this@KTMLinkForegroundService, android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
         val bondedMac = if (adapter != null && hasConnectPerm) {
             adapter.bondedDevices.firstOrNull { it.name?.contains("KTM") == true }?.address
@@ -338,17 +349,20 @@ class KTMLinkForegroundService : Service() {
     private fun connectGattDirect(device: BluetoothDevice) {
         if (bluetoothGatt != null) return
         Log.d(TAG, "connectGattDirect: ${device.name} (${device.address})")
-        prefs().edit().putString(PREFS_DEVICE_MAC, device.address).apply()
+        prefs().edit().putString(PREFS_DEVICE_MAC, device.address).commit()
+        // Cancel background scan — we have a live GATT connection in progress.
+        KtmBleScanReceiver.cancelBackgroundBleScan(this)
         KTMLinkServiceModule.emitEvent("CONNECTING", device.name ?: "KTM")
         bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     private fun closeGatt() {
         cancelHandshakeWatchdog()
-        try { bluetoothGatt?.disconnect(); bluetoothGatt?.close() } catch (_: Exception) {}
-        bluetoothGatt = null
+        val old = bluetoothGatt
+        bluetoothGatt = null          // null FIRST so stale callbacks self-discard
         gattHandler.post { clearWriteQueue() }
         resetHandshakeState()
+        try { old?.disconnect(); old?.close() } catch (_: Exception) {}
     }
 
     private fun scheduleReconnectScan() {
@@ -418,25 +432,12 @@ class KTMLinkForegroundService : Service() {
     // ── Handshake helpers ─────────────────────────────────────────────────────
 
     private fun enableAuthReqIndications(gatt: BluetoothGatt) {
-        val svc  = gatt.getService(KtmNativeProtocol.MAIN_SERVICE) ?: run {
-            Log.e(TAG, "MAIN_SERVICE not found"); return
-        }
-        val char = svc.getCharacteristic(KtmNativeProtocol.AUTH_REQ) ?: run {
-            Log.e(TAG, "AUTH_REQ char not found"); return
-        }
-        gatt.setCharacteristicNotification(char, true)
-
-        val cccd = char.getDescriptor(KtmNativeProtocol.CCCD) ?: run {
-            Log.e(TAG, "CCCD descriptor not found on AUTH_REQ"); return
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
-        } else {
-            @Suppress("DEPRECATION")
-            cccd.value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-            @Suppress("DEPRECATION")
-            gatt.writeDescriptor(cccd)
-        }
+        // Routed through the write queue so onDescriptorWrite arrives with
+        // writeInFlight=true and queue accounting stays consistent. A raw
+        // gatt.writeDescriptor() outside the queue corrupts writeInFlight state
+        // and causes the next queued write to be double-fired.
+        enqueueCccd(gatt, KtmNativeProtocol.MAIN_SERVICE, KtmNativeProtocol.AUTH_REQ,
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE, "CCCD: AUTH_REQ indication")
     }
 
     private fun handleAuthPacket(gatt: BluetoothGatt, packet: ByteArray) {
@@ -550,7 +551,7 @@ class KTMLinkForegroundService : Service() {
                         Log.d(TAG, "KtmHandshake: AUTHENTICATED ✓")
                         emitLog("AUTHENTICATED ✓")
                         cancelHandshakeWatchdog()
-                        prefs().edit().putBoolean(PREFS_HAS_PAIRED, true).apply()
+                        prefs().edit().putBoolean(PREFS_HAS_PAIRED, true).commit()
                         KTMLinkServiceModule.emitEvent("AUTHENTICATED")
                         mainHandler.post { updateNotification("KTMLink — Connected to ${gatt.device?.name ?: "KTM"}") }
                         activateDashboard(gatt)
@@ -645,7 +646,47 @@ class KTMLinkForegroundService : Service() {
         writeQueue.addLast(WriteEntry(label, coalesceKey, block))
     }
 
+    private fun enqueueCccd(
+        gatt: BluetoothGatt,
+        serviceUuid: java.util.UUID,
+        charUuid: java.util.UUID,
+        value: ByteArray,
+        label: String
+    ) {
+        val svc = gatt.getService(serviceUuid) ?: run {
+            Log.e(TAG, "$label: Service not found"); return
+        }
+        val char = svc.getCharacteristic(charUuid) ?: run {
+            Log.e(TAG, "$label: Characteristic not found"); return
+        }
+        val cccd = char.getDescriptor(KtmNativeProtocol.CCCD) ?: run {
+            Log.e(TAG, "$label: CCCD not found"); return
+        }
+
+        enqueueWrite(label, coalesceKey = null, onDone = null) {
+            currentWriteIsDescriptor = true
+            val enable = (value contentEquals BluetoothGattDescriptor.ENABLE_INDICATION_VALUE) ||
+                         (value contentEquals BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            if (enable) gatt.setCharacteristicNotification(char, true)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(cccd, value) == 0
+            } else {
+                @Suppress("DEPRECATION")
+                cccd.value = value
+                @Suppress("DEPRECATION")
+                gatt.writeDescriptor(cccd)
+            }
+        }
+    }
+
     private fun activateDashboard(gatt: BluetoothGatt) {
+        enqueueCccd(gatt, KtmNativeProtocol.RCM_SERVICE, KtmNativeProtocol.RCM_REMOTE_CONTROL,
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE, "CCCD: RCM_REMOTE_CONTROL indication")
+        
+        enqueueCccd(gatt, KtmNativeProtocol.MAIN_SERVICE, KtmNativeProtocol.TBT_NAV_REQUEST,
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE, "CCCD: TBT_NAV_REQUEST notification")
+
         writeNavChar(gatt, KtmNativeProtocol.NAVIGATION_STATE,
             KtmNativeProtocol.buildNavigationStatePayload(guidanceOn = true, gpsIconOn = true),
             "NavState: guidance ON", coalesce = false)
@@ -689,7 +730,7 @@ class KTMLinkForegroundService : Service() {
     private fun saveSessionKeys(keys: List<ByteArray>) {
         val arr = JSONArray()
         keys.forEach { arr.put(KtmNativeCrypto.hex(it).replace(" ", "")) }
-        prefs().edit().putString(PREFS_SESSION_KEYS, arr.toString()).apply()
+        prefs().edit().putString(PREFS_SESSION_KEYS, arr.toString()).commit()
         Log.d(TAG, "saveSessionKeys: ${keys.size} keys persisted")
     }
 
@@ -863,7 +904,6 @@ class KTMLinkForegroundService : Service() {
         Log.d(TAG, "onCreate")
         createNotificationChannel()
         registerAdapterStateReceiver()
-        mainHandler.postDelayed(watchdogRunnable, RECONNECT_WATCHDOG_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -871,7 +911,7 @@ class KTMLinkForegroundService : Service() {
 
         val address = intent?.getStringExtra("EXTRA_DEVICE_ADDRESS")
         if (address != null) {
-            prefs().edit().putString(PREFS_DEVICE_MAC, address).apply()
+            prefs().edit().putString(PREFS_DEVICE_MAC, address).commit()
             Log.d(TAG, "Saved Classic BT MAC address from ACL intent: $address")
         }
 
@@ -889,6 +929,20 @@ class KTMLinkForegroundService : Service() {
             return START_STICKY
         }
 
+        if (intent?.action == ACTION_CONNECT_DIRECTLY) {
+            val mac = prefs().getString(PREFS_DEVICE_MAC, null)
+            if (mac != null) {
+                Log.d(TAG, "onStartCommand: ACTION_CONNECT_DIRECTLY → scanning for $mac")
+                updateNotification("KTMLink — Connecting...")
+                startBleScan()
+            } else {
+                Log.w(TAG, "onStartCommand: ACTION_CONNECT_DIRECTLY but no saved MAC — falling back to scan")
+                updateNotification("KTMLink — Searching for KTM...")
+                startBleScan()
+            }
+            return START_STICKY
+        }
+
         updateNotification("KTMLink — Searching for KTM...")
         startBleScan()
         return START_STICKY
@@ -897,7 +951,6 @@ class KTMLinkForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "onDestroy")
-        mainHandler.removeCallbacks(watchdogRunnable)
         cancelPendingRunnables()
         navEndDebounceHandler?.removeCallbacksAndMessages(null); navEndDebounceHandler = null
         stopSlot6()
@@ -906,6 +959,11 @@ class KTMLinkForegroundService : Service() {
         try { unregisterReceiver(mapsReceiver); mapsReceiverRegistered = false } catch (_: Exception) {}
         try { bluetoothGatt?.close(); bluetoothGatt = null } catch (_: Exception) {}
         gattThread.quitSafely()
+        // Arm background BLE scan so the system wakes us when KTM advertises,
+        // even if the service process is fully killed before it reconnects.
+        val savedMac = prefs().getString(PREFS_DEVICE_MAC, null)
+        KtmBleScanReceiver.scheduleBackgroundBleScan(this, savedMac)
+        Log.d(TAG, "onDestroy: background BLE scan armed for auto-relaunch")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

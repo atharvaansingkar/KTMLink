@@ -182,7 +182,7 @@ const App = () => {
             break;
           case 'PLEASE_PAIR_OS':
             setOsPairingRequired(true);
-            setConnectionStatus('offline');
+            setConnectionStatus('paired_offline');
             break;
           case 'CONNECTING':
             resetSteps();
@@ -424,7 +424,7 @@ const App = () => {
                 </View>
               </View>
               
-              {(connectionStatus === 'paired_offline' || connectionStatus === 'offline') && !osPairingRequired && (
+              {connectionStatus === 'paired_offline' && !osPairingRequired && (
                 <TouchableOpacity
                   style={[styles.btSettingsBtn, {marginTop: 16, backgroundColor: '#0066AA20', borderColor: '#0066AA'}]}
                   onPress={() => {
