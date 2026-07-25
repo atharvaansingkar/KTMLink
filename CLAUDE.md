@@ -180,9 +180,9 @@ Phase 1 core ride flow is **fully working and tested on bike**:
 
 ---
 
-## 12. Phase 2 Status — COMPLETE ✓ (with one open bug)
+## 12. Phase 2 Status — COMPLETE ✓ (all bugs fixed, tested on bike)
 
-All 8 native Kotlin files created and wired. App.tsx migrated to service-driven model — no BLE logic in JS layer. Foreground service runs with persistent notification. Nav pipeline fully native.
+All 8 native Kotlin files created and wired. App.tsx migrated to service-driven model — no BLE logic in JS layer. Foreground service runs with persistent notification. Nav pipeline fully native. Silent reconnect working.
 
 **Phase 2 steps completed:**
 
@@ -207,51 +207,21 @@ All 8 native Kotlin files created and wired. App.tsx migrated to service-driven 
 - App.tsx: `'offline'` → `'paired_offline'` TypeScript fix
 - `ACTION_CONNECT_DIRECTLY`: explicit branch in `onStartCommand()`
 
----
+**Silent reconnect fix (root cause found via APK decompilation):**
 
-## 13. OPEN BUG — Silent Reconnect Fails After Bike Power Cycle
+The working released APK (`NavigatorGen3-v0.3.0-beta.apk`, decompiled with jadx from `classes3.dex`) had a different CMD_HELLO handler than the repo source. When bike is **known + key pool stored + handshakeRecoveries==0**, the app replies `CMD_GENERATE_KEYS (1)` instead of echoing `CMD_HELLO (0)`. This signals the bike to skip re-pairing and proceed directly to SELECT_KEY. Echoing HELLO caused the bike to terminate with `status=19` (GATT_CONN_TERMINATE_PEER_USER).
 
-**Status: UNRESOLVED as of Phase 2. Must be fixed before Phase 3.**
+Fix applied to `KTMLinkForegroundService.kt`:
+- Added `handshakeRecoveries: Int` counter — incremented on watchdog timeout, reset on AUTHENTICATED or clean disconnect
+- `CMD_HELLO` handler: if `hasPaired && storedKeys.isNotEmpty() && handshakeRecoveries == 0` → load keys + reply `CMD_GENERATE_KEYS`; otherwise echo `CMD_HELLO`
 
-### Symptom
-
-First authentication works correctly (user accepts pairing prompt on bike TFT). After that, turning the bike off and back on should silently reconnect — no user interaction, no prompt, no GENERATE_KEYS. Instead, the handshake stalls at HELLO_EXCHANGED, logs `WRITE FAILED uuid=0b3e02 status=133`, disconnects, and immediately retries. This loop repeats indefinitely.
-
-In logs: after AUTHENTICATED at timestamp T, then DISCONNECTED, then reconnect attempt shows `CMD_SELECT_KEY retry idx=N — echo only` spam continuing at 1Hz even on the new connection, suggesting the bike is not receiving or accepting the echo.
-
-### What Was Tried (and Did Not Fix It)
-
-1. **`.apply()` → `.commit()` on all SharedPreferences saves** — keys are confirmed persisted, `loadSessionKeys()` returns 16 keys on 2nd connect. Not the root cause.
-2. **Stale GATT callback guard** (`if (gatt !== bluetoothGatt) return` on all callbacks) — reduces noise but does not fix the reconnect stall.
-3. **`closeGatt()` null ordering** — `bluetoothGatt = null` before `old.close()`. Structural improvement, did not fix reconnect.
-4. **`enableAuthReqIndications()` through write queue** — prevents double-write corruption. Structural improvement, did not fix reconnect.
-
-### Current Theory (Unverified)
-
-The reference app (`KTM-Nav-GEN3-reference`, `BccuConnectionService.kt`) uses **`LifecycleService`** with a coroutine scope (`lifecycleScope.launch`) for the post-disconnect scan delay. Our service uses `Handler.postDelayed` on `mainHandler`. The reference also calls `g.close()` while our `closeGatt()` may have a race between the handler-posted `clearWriteQueue()` and the actual `old.close()` call — the queue clear is async (posted to `gattHandler`) but `old.close()` is synchronous immediately after. This means `onCharacteristicWrite` can still fire on the old client after `close()`, land on `gattHandler`, see a clean queue, and call `drainQueue()` on stale state.
-
-A deeper issue may be that the bike's BCCU firmware on known-device reconnect sends HELLO and immediately (< 100ms) follows with SELECT_KEY. If our M2 write and HELLO echo are delayed in the queue behind the AUTH_REQ CCCD write, the bike may time out and close the GATT before we finish — hence `status=133` on AUTH_REP write.
-
-### Next Debugging Steps
-
-1. Add timestamp logging to every GATT callback entry to measure M1→M2, M2→HELLO, HELLO→echo, echo-ack→SELECT_KEY timing.
-2. Compare against reference app timing (reference uses `lifecycleScope` coroutines, not Handlers — timing may differ).
-3. Check if `CONNECT_SETTLE_MS = 10_000L` is too long — known-device reconnect may not need 10 seconds of settle.
-4. Consider porting the service to extend `LifecycleService` (add `androidx.lifecycle:lifecycle-service` dependency) to match the reference app's coroutine architecture exactly.
-5. Check if our `enableAuthReqIndications` → `enqueueCccd()` path is delaying M2 write: the AUTH_REQ CCCD must be written BEFORE M1 can be received. On reconnect, if CCCD needs to be re-written after MTU, it must complete before M1 arrives.
-
-### Reference App Comparison
-
-The open-source app `KTM-Nav-GEN3-reference` (cloned at `D:\KTMLink\KTM-Nav-GEN3-reference`) successfully silently reconnects. Key differences in their implementation:
-- Extends `LifecycleService`, uses `lifecycleScope.launch { delay(1500); startBleScan() }` for post-disconnect reconnect
-- Uses a single `synchronized(gattQueueLock)` with `gattBusy: Boolean` rather than a HandlerThread queue
-- Session keys stored per-MAC: key = `"session_keys_" + deviceAddress.uppercase()`
-- `commit()` (synchronous) for all persistence writes
-- Handshake timeout armed at `STATE_CONNECTED` (not at M1 arrival)
+**Connect speed fix:**
+- Known MAC: `startBleScan()` now calls `connectGattDirect()` immediately — no scan, no 10s settle
+- `RECONNECT_AFTER_DISCONNECT_MS`: 15,000ms → 1,500ms (matches KTMLinkTest)
 
 ---
 
-## 14. Phase 2.5 Status — Auto-Launch from Killed State ✓
+## 13. Phase 2.5 Status — Auto-Launch from Killed State ✓
 
 **Implemented via background BLE scan PendingIntent.**
 
@@ -269,9 +239,9 @@ Coverage matrix:
 
 ---
 
-## 15. Phase 3 Plan — Polish + Nice-to-Have Features
+## 14. Phase 3 Plan — Polish + Nice-to-Have Features
 
-**Prerequisites:** Resolve Section 13 (silent reconnect bug) first.
+**Prerequisites:** All met. Silent reconnect fixed, connect speed fixed.
 
 ### 3a. Production Frontend
 - Full production-grade React Native UI
@@ -298,7 +268,7 @@ Coverage matrix:
 
 ---
 
-## 16. Reference Files (src/others/) — DO NOT MODIFY
+## 15. Reference Files (src/others/) — DO NOT MODIFY
 
 These are source files from companion/decompiled KTM apps. They are ground truth for protocol correctness.
 
@@ -311,7 +281,7 @@ These are source files from companion/decompiled KTM apps. They are ground truth
 
 ---
 
-## 17. Testing Protocol
+## 16. Testing Protocol
 
 Atharva tests **indoors first** — verify all 6 fields appear correctly in the app's nav feed UI before going to the bike. The app's "NAVIGATION FEED" card shows all 6 parsed values in real time. Only after indoor validation, take to bike for BLE transmission test.
 
@@ -322,7 +292,7 @@ adb logcat -s KTMLinkService GattQueue KtmHandshake KtmCrypto NavParser MapScrap
 
 ---
 
-## 18. Known Non-Issues
+## 17. Known Non-Issues
 
 - UUID naming difference between `ax0.java` (`0706=TURN_EXTRA_INFO`, `0707=TURN_INFO`) and our code (`0706=TURN_INFO`, `0707=TURN_ROAD`) — `BccuProtocol.kt` (more authoritative source) matches our mapping. Not a bug.
 - `src/others/` files showing TypeScript errors — they are Kotlin/Java, not part of the RN build. Ignore.

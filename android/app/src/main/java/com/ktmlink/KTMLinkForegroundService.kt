@@ -46,8 +46,8 @@ class KTMLinkForegroundService : Service() {
         private const val PREFS_DEVICE_MAC = "ktm_device_mac"
 
         // From BccuConnectionService.kt reference — timing constants
-        private const val CONNECT_SETTLE_MS = 10_000L   // dash boot grace before GATT connect
-        private const val RECONNECT_AFTER_DISCONNECT_MS = 15_000L
+        private const val CONNECT_SETTLE_MS = 10_000L   // dash boot grace — only used when MAC is unknown (scan path)
+        private const val RECONNECT_AFTER_DISCONNECT_MS = 1_500L
         private const val RECONNECT_WATCHDOG_MS = 20_000L
         private const val NAV_END_DEBOUNCE_MS = 1_500L  // Maps remove+repost grace (short so welcome is near-instant)
 
@@ -77,6 +77,9 @@ class KTMLinkForegroundService : Service() {
     private var tempSecret: ByteArray? = null
     private var sessionKeys: List<ByteArray> = emptyList()
     private var activeSessionKey: ByteArray? = null
+    // Counts handshake timeouts since last successful auth. On retry, the silent
+    // reconnect path is disabled so the bike can fall back to its normal flow.
+    private var handshakeRecoveries: Int = 0
 
     // ── Nav-active flag ───────────────────────────────────────────────────────
     // True while a Google Maps route is live. Set to true the instant the first
@@ -174,6 +177,7 @@ class KTMLinkForegroundService : Service() {
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.d(TAG, "GATT disconnected (status=$status)")
+                    if (activeSessionKey != null) handshakeRecoveries = 0
                     navEndDebounceHandler?.removeCallbacksAndMessages(null)
                     navEndDebounceHandler = null
                     stopSlot6()
@@ -254,13 +258,16 @@ class KTMLinkForegroundService : Service() {
         }
     }
 
-    // ── BLE scan + settle approach ─────────────────────────────────────────────
+    // ── BLE connect / scan ────────────────────────────────────────────────────
+    // When the MAC is already known (saved or bonded), skip the scan+settle and
+    // call connectGattDirect immediately — same as KTMLinkTest behaviour.
+    // The 10-second settle is only needed the very first time (MAC unknown, bike
+    // found by name scan) to let the dash finish booting.
     private fun startBleScan() {
         if (bluetoothGatt != null) {
             Log.d(TAG, "startBleScan: already have GATT — skipping")
             return
         }
-        if (scanning) return
 
         val hasBtScan = ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
         val hasBtConnect = ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
@@ -274,26 +281,29 @@ class KTMLinkForegroundService : Service() {
             Log.w(TAG, "startBleScan: adapter unavailable or off")
             return
         }
+
+        val savedMac = prefs().getString(PREFS_DEVICE_MAC, null)
+        val hasConnectPerm = ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        val bondedMac = if (hasConnectPerm) {
+            adapter.bondedDevices?.firstOrNull { it.name?.contains("KTM") == true }?.address
+        } else null
+        val knownMac = bondedMac ?: savedMac
+
+        // Fast path: MAC is known — connect directly without scanning or settling
+        if (knownMac != null) {
+            Log.d(TAG, "startBleScan: known MAC $knownMac — connecting directly (no scan/settle)")
+            val device = adapter.getRemoteDevice(knownMac)
+            connectGattDirect(device)
+            return
+        }
+
+        // Slow path: first-ever connection, MAC unknown — scan by name then settle
+        if (scanning) return
         val scanner = adapter.bluetoothLeScanner ?: run {
             Log.w(TAG, "startBleScan: scanner unavailable")
             return
         }
 
-        val savedMac = prefs().getString(PREFS_DEVICE_MAC, null)
-        
-        val hasConnectPerm = ContextCompat.checkSelfPermission(this@KTMLinkForegroundService, android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-        val bondedMac = if (adapter != null && hasConnectPerm) {
-            adapter.bondedDevices.firstOrNull { it.name?.contains("KTM") == true }?.address
-        } else null
-        
-        val macToConnect = bondedMac ?: savedMac
-
-        val filters = if (macToConnect != null) {
-            listOf(ScanFilter.Builder().setDeviceAddress(macToConnect).build())
-        } else {
-            emptyList<ScanFilter>()
-        }
-        
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -301,21 +311,13 @@ class KTMLinkForegroundService : Service() {
         val cb = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device ?: return
-                // Filter by name if no MAC was available
-                if (macToConnect == null && dev.name?.contains("KTM") != true) return
+                if (dev.name?.contains("KTM") != true) return
                 Log.d(TAG, "Scan: found KTM ${dev.name} (${dev.address}) — settling ${CONNECT_SETTLE_MS / 1000}s before GATT connect")
                 stopBleScan()
                 if (bluetoothGatt != null || settleRunnable != null) return
-
-                val targetDevice = if (macToConnect != null && adapter != null) {
-                    adapter.getRemoteDevice(macToConnect)
-                } else {
-                    dev
-                }
-
                 val r = Runnable {
                     settleRunnable = null
-                    if (bluetoothGatt == null) connectGattDirect(targetDevice)
+                    if (bluetoothGatt == null) connectGattDirect(dev)
                 }
                 settleRunnable = r
                 mainHandler.postDelayed(r, CONNECT_SETTLE_MS)
@@ -329,10 +331,10 @@ class KTMLinkForegroundService : Service() {
         }
 
         try {
-            scanner.startScan(filters, settings, cb)
+            scanner.startScan(emptyList(), settings, cb)
             bleScanCallback = cb
             scanning = true
-            Log.d(TAG, "BLE scan started (target=${savedMac ?: "any KTM by name"})")
+            Log.d(TAG, "BLE scan started (no known MAC — scanning by name)")
         } catch (e: Exception) {
             Log.w(TAG, "startScan threw: ${e.message}")
         }
@@ -379,8 +381,9 @@ class KTMLinkForegroundService : Service() {
         cancelHandshakeWatchdog()
         val r = Runnable {
             handshakeWatchdog = null
-            Log.w(TAG, "Handshake watchdog timeout ($budgetMs ms) - forcing disconnect to recover ACL")
-            emitLog("ERROR: Timeout ($budgetMs ms) - Reconnecting")
+            handshakeRecoveries++
+            Log.w(TAG, "Handshake watchdog timeout ($budgetMs ms) attempt=$handshakeRecoveries - forcing disconnect to recover ACL")
+            emitLog("ERROR: Timeout ($budgetMs ms) attempt=$handshakeRecoveries - Reconnecting")
             closeGatt()
             scheduleReconnectScan()
         }
@@ -489,12 +492,30 @@ class KTMLinkForegroundService : Service() {
 
         when {
             cmd == KtmNativeProtocol.CMD_HELLO -> {
-                Log.d(TAG, "KtmHandshake: CMD_HELLO → echoing back")
-                emitLog("CMD_HELLO received — echoing")
-                val reply = KtmNativeCrypto.encryptControl(
-                    KtmNativeCrypto.buildControlPacket(KtmNativeProtocol.CMD_HELLO), secret, iv
-                )
-                writeAuthRep(gatt, reply, "HELLO echo")
+                val hasPaired = prefs().getBoolean(PREFS_HAS_PAIRED, false)
+                val storedKeys = if (hasPaired) loadSessionKeys() else emptyList()
+
+                if (hasPaired && storedKeys.isNotEmpty() && handshakeRecoveries == 0) {
+                    // Known bike + persisted keys + first attempt: silent reconnect path.
+                    // Load the key pool so SELECT_KEY can use it immediately, then reply
+                    // CMD_GENERATE_KEYS (1) — signals to the bike that we have the keys
+                    // and it should skip re-pairing and proceed straight to SELECT_KEY.
+                    sessionKeys = storedKeys
+                    Log.d(TAG, "KtmHandshake: CMD_HELLO (known bike, ${storedKeys.size} keys) — silent reconnect, replying GENERATE_KEYS")
+                    emitLog("CMD_HELLO known bike — silent reconnect (${storedKeys.size} keys)")
+                    val reply = KtmNativeCrypto.encryptControl(
+                        KtmNativeCrypto.buildControlPacket(KtmNativeProtocol.CMD_GENERATE_KEYS), secret, iv
+                    )
+                    writeAuthRep(gatt, reply, "HELLO→GENERATE_KEYS (silent reconnect)")
+                } else {
+                    // New bike, no stored keys, or retry after stall: echo HELLO back.
+                    Log.d(TAG, "KtmHandshake: CMD_HELLO (${if (hasPaired) "known/retry#$handshakeRecoveries" else "new bike"}, keys=${storedKeys.size}) — echoing")
+                    emitLog("CMD_HELLO ${if (hasPaired) "retry#$handshakeRecoveries" else "new bike"} — echoing")
+                    val reply = KtmNativeCrypto.encryptControl(
+                        KtmNativeCrypto.buildControlPacket(KtmNativeProtocol.CMD_HELLO), secret, iv
+                    )
+                    writeAuthRep(gatt, reply, "HELLO echo")
+                }
                 KTMLinkServiceModule.emitEvent("HELLO_EXCHANGED")
             }
 
@@ -551,6 +572,7 @@ class KTMLinkForegroundService : Service() {
                         Log.d(TAG, "KtmHandshake: AUTHENTICATED ✓")
                         emitLog("AUTHENTICATED ✓")
                         cancelHandshakeWatchdog()
+                        handshakeRecoveries = 0
                         prefs().edit().putBoolean(PREFS_HAS_PAIRED, true).commit()
                         KTMLinkServiceModule.emitEvent("AUTHENTICATED")
                         mainHandler.post { updateNotification("KTMLink — Connected to ${gatt.device?.name ?: "KTM"}") }
