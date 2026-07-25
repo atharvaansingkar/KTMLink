@@ -248,21 +248,39 @@ Coverage matrix:
 - Connection state display, nav feed card, settings screen
 - Replace current debug handshake log with clean status indicators
 
-### 3b. Phone Notification Mirroring
-- Intercept incoming call/WhatsApp/SMS notifications
-- Write to `NOTIFICATION (070a)` characteristic on KTM dash
-- Shows notification banner on TFT display
+### 3b. Phone Notification Mirroring — COMPLETE ✓
+- WhatsApp (1:1 and group), SMS/Google Messages/Samsung Messages, incoming calls mirrored to `NOTIFICATION (070a)`
+- Word-chunked ticker: prefix frame ("Anushka:") → body pairs ("Where are" → "you?") at 1.5s/frame
+- Group format: "[SASA]" → "Anushka:" → body chunks
+- Welcome screen: notification displays for 10s, then welcome screen restored
+- Nav active: `notifTakeover` flag pauses nav writes for 5s, queued nav writes flushed on takeover, notification chunks cycle with nav blink between (hardware behaviour, can't prevent)
+- WakeLock acquired for SMS packages so screen-off delivery works
+- Icon: `REROUTING(1)` — confirmed rendering on Gen-3 dash
+- `ACTION_NOTIFICATION_REMOVED` broadcast clears banner immediately if phone notification dismissed mid-display
 
-### 3c. Handlebar Button Handling
+### 3c. Saved Parking Spot
+- When bike disconnects (ridden to destination), save the phone's GPS coordinates
+- Show saved location on a map / share to Google Maps for walking navigation back to bike
+- Trigger: `DISCONNECTED` event from the service → capture `LocationManager` last known location
+- Display: small card in App.tsx with "Last parked" address + "Navigate back" button (opens Maps intent)
+
+### 3d. Overspeed Alerts (Nav active only)
+- Google Maps sends speed limit in notification extras (`android.mediaMetadata` or subText) during nav
+- Parse speed limit from nav notification in `KtmNativeNavParser.kt`
+- Compare against phone GPS speed (`LocationManager` or `SpeedMonitor`)
+- When over limit: send a brief `NOTIFICATION (070a)` banner (e.g. `"Speed: 72/60"`) using the existing notification mirroring path
+- Only active when `navActive = true` — silent otherwise
+
+### 3e. Handlebar Button Handling
 - Decode triple-Up button press from RCM_REMOTE_CONTROL (0103) characteristic
 - See `BccuConnectionService.kt` reference for button decode logic
 - Use for mode overlay, nav dismiss, etc.
 
-### 3d. Weather / Telemetry (PRPC Service)
+### 3f. Weather / Telemetry (PRPC Service)
 - PRPC service (`0600`) already stubbed in protocol
 - Weather overlay on dash, ride telemetry logging
 
-### 3e. Phase 1 JS Cleanup
+### 3g. Phase 1 JS Cleanup
 - Delete `src/services/BleManager.ts` (no longer called)
 - Delete `src/services/NavParser.ts`, `TurnIconMapper.ts`, `KtmProtocol.ts`, `KtmCrypto.ts` (replaced by native Kotlin ports)
 

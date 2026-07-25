@@ -845,6 +845,7 @@ class KTMLinkForegroundService : Service() {
     private fun streamLiveNavigation(gatt: BluetoothGatt, parsed: KtmNativeNavParser.ParsedNavData) {
         gattHandler.post {
             if (!navActive) return@post
+            if (notifTakeover) return@post  // Notification owns the dash for a few seconds; skip nav writes
             writeQueue.removeAll { it.label.startsWith("Welcome:") }
 
             val vis = KtmNativeProtocol.Visibility.FULL
@@ -879,10 +880,202 @@ class KTMLinkForegroundService : Service() {
         }
     }
 
+    // ── Phone/WhatsApp notification mirroring ─────────────────────────────────
+
+    // Timing constants
+    private val NOTIF_WELCOME_MS = 10_000L  // welcome screen: show for 10s then restore welcome
+    private val NOTIF_NAV_MS     =  5_000L  // nav active: show for 5s then clear
+    private val NOTIF_CHUNK_MS   =  1_500L  // time per 2-word chunk
+
+    // When true, streamLiveNavigation() skips writes so the notification owns the dash.
+    @Volatile private var notifTakeover = false
+
+    private var notifClearRunnable:  Runnable? = null
+    private var notifTickerRunnable: Runnable? = null
+
+    // Truncate whole words to 15 max, drop the rest silently.
+    private fun wordLimit15(text: String): String {
+        val words = text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        return words.take(15).joinToString(" ")
+    }
+
+    // prefixFrames: ordered header frames shown before the body (e.g. ["[SASA]", "Anushka:"])
+    // body: full message text (words, up to 15-word limit)
+    private data class NotifParts(val prefixFrames: List<String>, val body: String)
+
+    private fun parseNotif(sender: String, body: String, type: String, isGroup: Boolean): NotifParts {
+        if (type == "call") return NotifParts(listOf("Call: ${sender.take(13)}".take(15)), "")
+
+        val MEDIA_PATTERNS = listOf(
+            "image" to "Photo", "photo" to "Photo", "video" to "Video",
+            "audio" to "Audio", "document" to "Doc", "sticker" to "Sticker",
+            "gif" to "GIF", "contact card" to "Contact",
+            "voice message" to "Voice", "missed" to "Missed"
+        )
+        val bodyLower = body.trim().lowercase()
+        val isMedia = bodyLower.isEmpty() || MEDIA_PATTERNS.any { (pat, _) -> bodyLower.contains(pat) }
+        if (isMedia) {
+            val label = MEDIA_PATTERNS.firstOrNull { (pat, _) -> bodyLower.contains(pat) }?.second ?: "Media"
+            return NotifParts(listOf("${sender.take(8)}: $label".take(15)), "")
+        }
+
+        return if (isGroup) {
+            // body = "SenderName: actual message"
+            val colonIdx = body.indexOf(':')
+            val (msgSender, msgBody) = if (colonIdx > 0) {
+                body.substring(0, colonIdx).trim() to body.substring(colonIdx + 1).trim()
+            } else {
+                sender to body
+            }
+            // Three header frames: group name, then sender name, then body chunks
+            NotifParts(
+                listOf("[${sender.take(13)}]".take(15), "${msgSender.take(14)}:".take(15)),
+                wordLimit15(msgBody)
+            )
+        } else {
+            NotifParts(listOf("${sender.take(14)}:".take(15)), wordLimit15(body))
+        }
+    }
+
+    // Build ticker frames:
+    //   - All prefixFrames first (one per entry, shown as-is)
+    //   - Then body words: 2 per frame; if 2 words exceed 15 chars, show 1 word instead
+    // e.g. group "[SASA]" + "Anushka:" + "Where are you?" →
+    //   "[SASA]"  →  "Anushka:"  →  "Where are"  →  "you?"
+    private fun buildChunks(parts: NotifParts): List<String> {
+        val frames = parts.prefixFrames.toMutableList()
+        if (parts.body.isEmpty()) return frames
+
+        val bodyWords = parts.body.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        var i = 0
+        while (i < bodyWords.size) {
+            if (i + 1 < bodyWords.size) {
+                val twoWords = "${bodyWords[i]} ${bodyWords[i + 1]}"
+                if (twoWords.length <= 15) {
+                    frames.add(twoWords)
+                    i += 2
+                } else {
+                    frames.add(bodyWords[i].take(15))
+                    i += 1
+                }
+            } else {
+                frames.add(bodyWords[i].take(15))
+                i += 1
+            }
+        }
+        return frames
+    }
+
+    private fun sendNotifPayload(gatt: BluetoothGatt, text: String) {
+        val payload = KtmNativeProtocol.buildNotificationPayload(
+            text, KtmNativeProtocol.NotificationIcon.REROUTING, KtmNativeProtocol.Visibility.FULL
+        )
+        // coalesce = true: if a previous ticker frame is still queued, replace it so frames
+        // never pile up behind nav writes and appear as rapid-fire glitches.
+        writeNavChar(gatt, KtmNativeProtocol.NOTIFICATION, payload, "Notif: $text", coalesce = true)
+    }
+
+    private fun clearNotifOnDash(gatt: BluetoothGatt) {
+        val payload = KtmNativeProtocol.buildNotificationPayload(
+            "", KtmNativeProtocol.NotificationIcon.REROUTING, KtmNativeProtocol.Visibility.OFF
+        )
+        writeNavChar(gatt, KtmNativeProtocol.NOTIFICATION, payload, "Notif: clear", coalesce = true)
+    }
+
+    // Flush all queued nav writes so the notification frame is next in line.
+    private fun flushNavWritesFromQueue() {
+        gattHandler.post {
+            writeQueue.removeAll {
+                it.label.startsWith("Nav:") || it.label.startsWith("Slot6:")
+            }
+        }
+    }
+
+    private fun cancelNotifTimers() {
+        notifClearRunnable?.let  { mainHandler.removeCallbacks(it) }; notifClearRunnable  = null
+        notifTickerRunnable?.let { mainHandler.removeCallbacks(it) }; notifTickerRunnable = null
+    }
+
+    private fun sendDashNotification(sender: String, body: String, type: String, isGroup: Boolean = false) {
+        val gatt = bluetoothGatt ?: return
+        if (activeSessionKey == null) return
+
+        val parts  = parseNotif(sender, body, type, isGroup)
+        val chunks = buildChunks(parts)
+        val displayMs = if (navActive) NOTIF_NAV_MS else NOTIF_WELCOME_MS
+
+        Log.d(TAG, "Notification: ${chunks.size} chunks, displayMs=$displayMs, nav=$navActive, chunks=$chunks")
+        emitLog("NOTIF (${chunks.size} chunks): ${chunks.firstOrNull()}")
+        KTMLinkServiceModule.emitNotification(sender, body, type)
+
+        // Cancel previous notification and steal the dash.
+        // Flush any queued nav writes so the first notification frame is next in line.
+        cancelNotifTimers()
+        notifTakeover = true
+        flushNavWritesFromQueue()
+
+        // Send first frame immediately
+        sendNotifPayload(gatt, chunks[0])
+
+        // Ticker: cycle through remaining chunks on mainHandler (same thread as clear)
+        if (chunks.size > 1) {
+            var idx = 0
+            val tick = object : Runnable {
+                override fun run() {
+                    val g = bluetoothGatt ?: return
+                    if (activeSessionKey == null) return
+                    idx = (idx + 1) % chunks.size
+                    sendNotifPayload(g, chunks[idx])
+                    notifTickerRunnable = this
+                    mainHandler.postDelayed(this, NOTIF_CHUNK_MS)
+                }
+            }
+            notifTickerRunnable = tick
+            mainHandler.postDelayed(tick, NOTIF_CHUNK_MS)
+        }
+
+        // After displayMs: stop ticker, clear dash, restore nav/welcome
+        val clear = Runnable {
+            notifClearRunnable  = null
+            notifTickerRunnable?.let { mainHandler.removeCallbacks(it) }; notifTickerRunnable = null
+            notifTakeover = false
+            val g = bluetoothGatt ?: return@Runnable
+            if (activeSessionKey == null) return@Runnable
+            clearNotifOnDash(g)
+            // On welcome screen: restore welcome after clearing the notification.
+            // On nav: normal nav writes resume automatically (notifTakeover = false).
+            if (!navActive) showWelcomeScreen(g)
+        }
+        notifClearRunnable = clear
+        mainHandler.postDelayed(clear, displayMs)
+    }
+
+    fun clearActiveNotification(gatt: BluetoothGatt) {
+        cancelNotifTimers()
+        notifTakeover = false
+        clearNotifOnDash(gatt)
+    }
+
     private var mapsReceiverRegistered = false
     private val mapsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
+                MapScraperService.ACTION_NOTIFICATION_REMOVED -> {
+                    // Phone notification dismissed — if we're still mid-display, cancel immediately.
+                    if (notifTakeover) {
+                        val g = bluetoothGatt ?: return
+                        if (activeSessionKey == null) return
+                        clearActiveNotification(g)
+                        if (!navActive) showWelcomeScreen(g)
+                    }
+                }
+                MapScraperService.ACTION_NOTIFICATION -> {
+                    val sender  = intent.getStringExtra(MapScraperService.EXTRA_NOTIF_SENDER)   ?: return
+                    val body    = intent.getStringExtra(MapScraperService.EXTRA_NOTIF_BODY)     ?: ""
+                    val type    = intent.getStringExtra(MapScraperService.EXTRA_NOTIF_TYPE)     ?: "message"
+                    val isGroup = intent.getBooleanExtra(MapScraperService.EXTRA_NOTIF_IS_GROUP, false)
+                    sendDashNotification(sender, body, type, isGroup)
+                }
                 MapScraperService.ACTION_MAPS_UPDATE -> {
                     navEndDebounceHandler?.removeCallbacksAndMessages(null)
                     navEndDebounceHandler = null
@@ -912,6 +1105,9 @@ class KTMLinkForegroundService : Service() {
                         if (activeSessionKey == null) return@postDelayed
                         if (navActive) return@postDelayed  // route restarted during debounce
                         Log.d(TAG, "Nav end confirmed — showing welcome screen")
+                        // If a notification was mid-display on the nav takeover path, cancel it
+                        // so welcome screen appears immediately.
+                        if (notifTakeover) clearActiveNotification(gatt)
                         // showWelcomeScreen handles stopSlot6 atomically inside gattHandler.
                         showWelcomeScreen(gatt)
                     }, NAV_END_DEBOUNCE_MS)
@@ -974,6 +1170,8 @@ class KTMLinkForegroundService : Service() {
         super.onDestroy()
         Log.d(TAG, "onDestroy")
         cancelPendingRunnables()
+        notifClearRunnable?.let { mainHandler.removeCallbacks(it) }; notifClearRunnable = null
+        notifTickerRunnable?.let { mainHandler.removeCallbacks(it) }; notifTickerRunnable = null
         navEndDebounceHandler?.removeCallbacksAndMessages(null); navEndDebounceHandler = null
         stopSlot6()
         stopBleScan()
@@ -1032,6 +1230,8 @@ class KTMLinkForegroundService : Service() {
         val filter = IntentFilter().apply {
             addAction(MapScraperService.ACTION_MAPS_UPDATE)
             addAction(MapScraperService.ACTION_MAPS_REMOVED)
+            addAction(MapScraperService.ACTION_NOTIFICATION)
+            addAction(MapScraperService.ACTION_NOTIFICATION_REMOVED)
         }
         ContextCompat.registerReceiver(this, mapsReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         mapsReceiverRegistered = true

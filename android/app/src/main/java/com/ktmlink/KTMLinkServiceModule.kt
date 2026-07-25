@@ -53,6 +53,28 @@ class KTMLinkServiceModule(private val reactContext: ReactApplicationContext) :
                 Log.w(TAG, "emitLog failed: ${e.message}")
             }
         }
+
+        /**
+         * Emits a mirrored notification event to JS so the app can display it in-session.
+         * sender: display name (caller name / chat name)
+         * body: message text (empty for calls)
+         * notifType: "call" | "message"
+         */
+        fun emitNotification(sender: String, body: String, notifType: String) {
+            val ctx = ctxRef?.get() ?: return
+            try {
+                val map = Arguments.createMap().apply {
+                    putString("type", "NOTIF")
+                    putString("sender", sender)
+                    putString("body", body)
+                    putString("notifType", notifType)
+                }
+                ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit("onKtmEvent", map)
+            } catch (e: Exception) {
+                Log.w(TAG, "emitNotification failed: ${e.message}")
+            }
+        }
     }
 
     init {
