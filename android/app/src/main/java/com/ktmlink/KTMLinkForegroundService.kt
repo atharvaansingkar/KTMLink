@@ -54,6 +54,7 @@ class KTMLinkForegroundService : Service() {
         const val ACTION_START = "com.ktmlink.ACTION_START"
         const val ACTION_STOP  = "com.ktmlink.ACTION_STOP"
         const val ACTION_CONNECT_DIRECTLY = "com.ktmlink.ACTION_CONNECT_DIRECTLY"
+        const val ACTION_TEST_WEATHER = "com.ktmlink.ACTION_TEST_WEATHER"
     }
 
     // ── BLE state ─────────────────────────────────────────────────────────────
@@ -743,6 +744,7 @@ class KTMLinkForegroundService : Service() {
 
             Log.d(TAG, "Welcome screen queued atomically (queue depth=${writeQueue.size})")
             if (!writeInFlight) drainQueue()
+            mainHandler.post { triggerIdleSlotRefresh(gatt) }
         }
     }
 
@@ -840,6 +842,50 @@ class KTMLinkForegroundService : Service() {
         slot6Version++
         slot6Handler?.removeCallbacksAndMessages(null)
         slot6Handler = null; slot6DistText = ""; slot6TimeText = ""
+    }
+
+    // ── Idle weather refresh ──────────────────────────────────────────────────
+    @Volatile private var idleFetchVersion = 0
+    private var weatherRefreshRunnable: Runnable? = null
+
+    private fun triggerIdleSlotRefresh(gatt: BluetoothGatt) {
+        val myVersion = ++idleFetchVersion
+        weatherRefreshRunnable?.let { mainHandler.removeCallbacks(it) }
+        weatherRefreshRunnable = null
+
+        val lm = getSystemService(LOCATION_SERVICE) as android.location.LocationManager
+        val loc = lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+            ?: lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+
+        if (loc == null) {
+            Log.d(TAG, "Idle weather: no last location — skipping")
+            return
+        }
+
+        KtmIdleWeatherFetcher.fetch(loc.latitude, loc.longitude, onResult = { data: IdleWeatherData? ->
+            if (data == null || idleFetchVersion != myVersion || navActive) return@fetch
+            val g = bluetoothGatt ?: return@fetch
+            val full = KtmNativeProtocol.Visibility.FULL
+            writeNavChar(g, KtmNativeProtocol.TURN_DISTANCE,
+                KtmNativeProtocol.buildTurnDistancePayload("${data.tempC}°C", full), "Idle: temp")
+            writeNavChar(g, KtmNativeProtocol.TURN_INFO,
+                KtmNativeProtocol.buildTurnInfoPayload(data.condition, full), "Idle: condition")
+            writeNavChar(g, KtmNativeProtocol.REMAINING_DISTANCE,
+                KtmNativeProtocol.buildRemainingDistancePayload("AQI ${data.usAqi}", full), "Idle: aqi")
+            Log.d(TAG, "Idle weather written: ${data.tempC}°C / ${data.condition} / AQI ${data.usAqi}")
+            KTMLinkServiceModule.emitWeather(data.tempC, data.condition, data.usAqi)
+        })
+
+        // Refresh every 5 minutes while connected and idle
+        val r = object : Runnable {
+            override fun run() {
+                val g = bluetoothGatt ?: return
+                if (navActive) { mainHandler.postDelayed(this, 5 * 60 * 1000L); return }
+                triggerIdleSlotRefresh(g)
+            }
+        }
+        weatherRefreshRunnable = r
+        mainHandler.postDelayed(r, 5 * 60 * 1000L)
     }
 
     private fun streamLiveNavigation(gatt: BluetoothGatt, parsed: KtmNativeNavParser.ParsedNavData) {
@@ -1147,6 +1193,36 @@ class KTMLinkForegroundService : Service() {
             return START_STICKY
         }
 
+        if (intent?.action == ACTION_TEST_WEATHER) {
+            val lm = getSystemService(LOCATION_SERVICE) as android.location.LocationManager
+            val loc = lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
+            if (loc == null) {
+                KTMLinkServiceModule.emitEvent("WEATHER_ERROR", "No location available")
+                return START_STICKY
+            }
+            KtmIdleWeatherFetcher.fetch(loc.latitude, loc.longitude, onResult = { data: IdleWeatherData? ->
+                if (data == null) {
+                    KTMLinkServiceModule.emitEvent("WEATHER_ERROR", "Fetch failed")
+                } else {
+                    KTMLinkServiceModule.emitWeather(data.tempC, data.condition, data.usAqi)
+                    Log.d(TAG, "Manual weather update: ${data.tempC}°C / ${data.condition} / AQI ${data.usAqi}")
+                    // Also push to bike dash if connected and idle
+                    val g = bluetoothGatt
+                    if (g != null && activeSessionKey != null && !navActive) {
+                        val full = KtmNativeProtocol.Visibility.FULL
+                        writeNavChar(g, KtmNativeProtocol.TURN_DISTANCE,
+                            KtmNativeProtocol.buildTurnDistancePayload("${data.tempC}°C", full), "Update: temp")
+                        writeNavChar(g, KtmNativeProtocol.TURN_INFO,
+                            KtmNativeProtocol.buildTurnInfoPayload(data.condition, full), "Update: condition")
+                        writeNavChar(g, KtmNativeProtocol.REMAINING_DISTANCE,
+                            KtmNativeProtocol.buildRemainingDistancePayload("AQI ${data.usAqi}", full), "Update: aqi")
+                    }
+                }
+            })
+            return START_STICKY
+        }
+
         if (intent?.action == ACTION_CONNECT_DIRECTLY) {
             val mac = prefs().getString(PREFS_DEVICE_MAC, null)
             if (mac != null) {
@@ -1173,6 +1249,8 @@ class KTMLinkForegroundService : Service() {
         notifClearRunnable?.let { mainHandler.removeCallbacks(it) }; notifClearRunnable = null
         notifTickerRunnable?.let { mainHandler.removeCallbacks(it) }; notifTickerRunnable = null
         navEndDebounceHandler?.removeCallbacksAndMessages(null); navEndDebounceHandler = null
+        idleFetchVersion++
+        weatherRefreshRunnable?.let { mainHandler.removeCallbacks(it) }; weatherRefreshRunnable = null
         stopSlot6()
         stopBleScan()
         adapterStateReceiver?.let { runCatching { unregisterReceiver(it) } }; adapterStateReceiver = null

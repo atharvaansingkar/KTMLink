@@ -108,6 +108,22 @@ const App = () => {
   const [osPairingRequired, setOsPairingRequired] = useState(false);
   const [isAppRegistered, setIsAppRegistered]     = useState(false);
 
+  // Weather state
+  const [weather, setWeather]           = useState<{tempC: number; condition: string; usAqi: number} | null>(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherError, setWeatherError] = useState<string | null>(null);
+
+  // Notification feed state
+  type NotifItem = {id: string; sender: string; body: string; type: 'call' | 'message'; ts: string};
+  const [notifFeed, setNotifFeed] = useState<NotifItem[]>([]);
+  const notifIdRef = useRef(0);
+  const addNotif = (sender: string, body: string, type: 'call' | 'message') => {
+    const id = String(++notifIdRef.current);
+    const ts = new Date().toLocaleTimeString('en-IN', {hour: '2-digit', minute: '2-digit'});
+    setNotifFeed(prev => [{id, sender, body, type, ts}, ...prev].slice(0, 3));
+  };
+  const clearNotifFeed = () => setNotifFeed([]);
+
 
   // Nav card flash
   const cardFlash = useRef(new Animated.Value(0)).current;
@@ -142,6 +158,8 @@ const App = () => {
     AsyncStorage.getItem('APP_IS_REGISTERED').then(val => {
       if (val === 'true') setIsAppRegistered(true);
     });
+    // Re-push cached weather immediately when app opens/foregrounds
+    KTMLinkService?.requestCurrentWeather?.();
   };
 
   // ─── Boot ────────────────────────────────────────────────────────────────────
@@ -160,7 +178,7 @@ const App = () => {
     // ─── Service events ───────────────────────────────────────────────────────
     const svcSub = serviceEmitter.addListener(
       'onKtmEvent',
-      (event: {type: string; name?: string; msg?: string; sender?: string; body?: string; notifType?: string}) => {
+      (event: {type: string; name?: string; msg?: string; sender?: string; body?: string; notifType?: string; tempC?: number; condition?: string; usAqi?: number}) => {
         switch (event.type) {
           case 'CONNECTING':
             setConnectionStatus('connecting');
@@ -187,6 +205,17 @@ const App = () => {
           case 'PLEASE_PAIR_OS':
             setOsPairingRequired(true);
             setConnectionStatus('paired_offline');
+            break;
+          case 'WEATHER':
+            if (event.tempC !== undefined && event.condition && event.usAqi !== undefined) {
+              setWeather({tempC: event.tempC, condition: event.condition, usAqi: event.usAqi});
+              setWeatherLoading(false);
+              setWeatherError(null);
+            }
+            break;
+          case 'WEATHER_ERROR':
+            setWeatherLoading(false);
+            setWeatherError(event.name ?? 'Fetch failed');
             break;
           case 'NOTIF':
             if (event.sender) {
@@ -359,6 +388,46 @@ const App = () => {
           {lastUpdated && <Text style={styles.timestamp}>Last update: {lastUpdated}</Text>}
         </Animated.View>
 
+        {/* Weather — shown on welcome screen, cleared during nav */}
+        <View style={styles.weatherHeader}>
+          <Text style={styles.sectionLabel}>DASHBOARD WEATHER</Text>
+          <TouchableOpacity
+            style={styles.updateBtn}
+            onPress={() => {
+              setWeatherLoading(true);
+              setWeatherError(null);
+              KTMLinkService?.testWeatherFetch?.();
+            }}
+            disabled={weatherLoading}
+            activeOpacity={0.8}>
+            <Text style={styles.updateBtnText}>{weatherLoading ? '...' : 'UPDATE'}</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.card}>
+          {weatherError ? (
+            <Text style={[styles.timestamp, {color: '#F44336'}]}>Error: {weatherError}</Text>
+          ) : weather ? (
+            <View style={styles.weatherRow}>
+              <View style={styles.weatherCell}>
+                <Text style={styles.cellLabel}>TEMP</Text>
+                <Text style={styles.cellValue}>{weather.tempC}°C</Text>
+              </View>
+              <View style={styles.weatherCell}>
+                <Text style={styles.cellLabel}>CONDITION</Text>
+                <Text style={styles.cellValue}>{weather.condition}</Text>
+              </View>
+              <View style={styles.weatherCell}>
+                <Text style={styles.cellLabel}>AQI</Text>
+                <Text style={[styles.cellValue, {
+                  color: weather.usAqi > 100 ? '#F44336' : weather.usAqi > 50 ? '#FF9800' : '#FF6600',
+                }]}>{weather.usAqi}</Text>
+              </View>
+            </View>
+          ) : (
+            <Text style={styles.timestamp}>Auto-fetches on connect. Tap UPDATE to refresh.</Text>
+          )}
+        </View>
+
         {/* Bike Connection */}
         <Text style={[styles.sectionLabel, {marginTop: 24}]}>BIKE CONNECTION</Text>
         <View style={styles.card}>
@@ -503,6 +572,12 @@ const styles = StyleSheet.create({
   notifBody:    {color: '#888', fontSize: 12, lineHeight: 18},
 
   footer: {textAlign: 'center', color: '#2a2a2a', fontSize: 10, marginTop: 24, letterSpacing: 1},
+
+  weatherHeader: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8},
+  updateBtn:     {borderWidth: 1, borderColor: '#FF660060', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 5},
+  updateBtnText: {color: '#FF6600', fontSize: 10, fontWeight: '800', letterSpacing: 2},
+  weatherRow:    {flexDirection: 'row', justifyContent: 'space-between'},
+  weatherCell:   {flex: 1, marginRight: 8, backgroundColor: '#1a1a1a', padding: 8, borderRadius: 6, borderWidth: 1, borderColor: '#2e2e2e'},
 });
 
 export default App;
